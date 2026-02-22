@@ -140,11 +140,118 @@ def _spatial_energy(x: torch.Tensor) -> torch.Tensor:
     g = torch.sqrt(dx*dx + dy*dy + 1e-8)
     return g.mean(dim=(1,2,3))
 
-def _to_01(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # x: (H,W)
-    x = x - x.min()
-    x = x / (x.max() + eps)
-    return x
+import math
+import torch
+import torch.nn.functional as F
+from torchvision.utils import make_grid
+
+def _to_01(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x = x.float()
+    mn = x.min()
+    mx = x.max()
+    return (x - mn) / (mx - mn + eps)
+
+@torch.no_grad()
+def _normalize_per_map(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    x: (N, 1, H, W) or (N, C, H, W)
+    Normalize each map independently to [0, 1].
+    """
+    x = x.float()
+    x_min = x.amin(dim=(-2, -1), keepdim=True)
+    x_max = x.amax(dim=(-2, -1), keepdim=True)
+    return (x - x_min) / (x_max - x_min + eps)
+
+@torch.no_grad()
+def _make_side_by_side_channel_grid(
+    s_bdhw: torch.Tensor,   # (D, H, W)
+    t_bdhw: torch.Tensor,   # (D, H, W)
+    max_px: int = 2000,
+    max_channels: int = 256,
+    padding: int = 2,
+    debug_once: bool = False,
+) -> torch.Tensor:
+    import math
+    import torch
+    import torch.nn.functional as F
+    from torchvision.utils import make_grid
+
+    # ---- sanity on input ----
+    assert s_bdhw.ndim == 3 and t_bdhw.ndim == 3, f"expected (D,H,W), got {s_bdhw.shape}, {t_bdhw.shape}"
+
+    D = min(int(s_bdhw.shape[0]), int(t_bdhw.shape[0]), int(max_channels))
+    s0 = s_bdhw[:D].float()
+    t0 = t_bdhw[:D].float()
+
+    # (D,1,H,W)
+    s_maps = _normalize_per_map(s0.unsqueeze(1))
+    t_maps = _normalize_per_map(t0.unsqueeze(1))
+
+    # shared grid layout
+    nrow = max(1, int(math.floor(math.sqrt(D))))
+    ncol = int(math.ceil(D / nrow))
+
+    # pick tile size (cap to max_px per grid)
+    tile_w = max(1, (max_px - padding * (nrow - 1)) // nrow)
+    tile_h = max(1, (max_px - padding * (ncol - 1)) // ncol)
+    tile = int(max(8, min(64, tile_w, tile_h)))
+
+    s_maps = F.interpolate(s_maps, size=(tile, tile), mode="bilinear", align_corners=False)
+    t_maps = F.interpolate(t_maps, size=(tile, tile), mode="bilinear", align_corners=False)
+
+    # make_grid returns (C,H,W)
+    s_grid = make_grid(s_maps, nrow=nrow, padding=padding, normalize=False)  # (1,H,W)
+    t_grid = make_grid(t_maps, nrow=nrow, padding=padding, normalize=False)  # (1,H,W)
+
+    # Force CHW explicitly
+    if s_grid.ndim != 3:
+        raise RuntimeError(f"make_grid(s) expected 3D (C,H,W), got {s_grid.shape}")
+    if t_grid.ndim != 3:
+        raise RuntimeError(f"make_grid(t) expected 3D (C,H,W), got {t_grid.shape}")
+
+    # Convert to 3ch
+    if s_grid.shape[0] == 1:
+        s_grid = s_grid.repeat(3, 1, 1)
+    elif s_grid.shape[0] != 3:
+        # if somehow C != 1/3, take first channel and repeat
+        s_grid = s_grid[:1].repeat(3, 1, 1)
+
+    if t_grid.shape[0] == 1:
+        t_grid = t_grid.repeat(3, 1, 1)
+    elif t_grid.shape[0] != 3:
+        t_grid = t_grid[:1].repeat(3, 1, 1)
+
+    # Now both are (3,H,W). Pad heights to match.
+    Hs, Ws = int(s_grid.shape[1]), int(s_grid.shape[2])
+    Ht, Wt = int(t_grid.shape[1]), int(t_grid.shape[2])
+    H = max(Hs, Ht)
+
+    if Hs != H:
+        s_grid = F.pad(s_grid, (0, 0, 0, H - Hs), value=1.0)  # pad bottom
+    if Ht != H:
+        t_grid = F.pad(t_grid, (0, 0, 0, H - Ht), value=1.0)
+
+    # Separator: MUST be (3,H,sepW)
+    sepW = padding * 4
+    sep = torch.ones((3, H, sepW), dtype=s_grid.dtype, device=s_grid.device)
+
+    if debug_once:
+        print("DBG _make_side_by_side_channel_grid:")
+        print(" D", D, "nrow", nrow, "ncol", ncol, "tile", tile)
+        print(" s_grid", tuple(s_grid.shape), "t_grid", tuple(t_grid.shape), "sep", tuple(sep.shape))
+
+    # Final concat along width
+    out = torch.cat([s_grid, sep, t_grid], dim=2)  # (3,H,W_total)
+
+    # final safety cap
+    H, W = int(out.shape[1]), int(out.shape[2])
+    scale = min(1.0, float(max_px) / float(max(H, W)))
+    if scale < 1.0:
+        newH = max(1, int(round(H * scale)))
+        newW = max(1, int(round(W * scale)))
+        out = F.interpolate(out.unsqueeze(0), size=(newH, newW), mode="bilinear", align_corners=False).squeeze(0)
+
+    return out.clamp(0, 1)
 
 @torch.no_grad()
 def log_spatial_compare_first_sample(
@@ -156,41 +263,46 @@ def log_spatial_compare_first_sample(
     Wt: int,
     tag_prefix: str = "val/spatial_compare",
     max_side: int = 512,
+    # NEW:
+    log_channel_grid: bool = True,
+    channel_grid_max_px: int = 2000,
+    channel_grid_max_channels: int = 256,
 ):
     """
-    Logs:
-      - cosine similarity heatmap (1 x H x W)
-      - L2 error heatmap (1 x H x W)
-      - optional RGB composite (3 x H x W): [cos, l2, 0]
+    Logs (first sample only):
+      - cosine similarity heatmap (1 x H x W), remapped to [0,1] for viz
+      - L2 error heatmap (1 x H x W), normalized to [0,1] for viz
+      - RGB composite (3 x H x W): [cos, l2, 0]
       - scalars for the first sample
+      - OPTIONAL: side-by-side channel grid (student | teacher), capped to 2000px
     """
     assert s_spatial_bdhw.ndim == 4
     assert t_tokens_btd.ndim == 3
 
     # First sample
-    s = s_spatial_bdhw[0]          # (Dt, Ht, Wt)
-    t_tokens = t_tokens_btd[0]     # (T, Dt)
+    s = s_spatial_bdhw[0].detach()          # (Dt, Ht, Wt)
+    t_tokens = t_tokens_btd[0].detach()     # (T, Dt)
     assert t_tokens.shape[0] == Ht * Wt, f"T={t_tokens.shape[0]} != Ht*Wt={Ht*Wt}"
 
     # Teacher: (T,Dt) -> (Dt,Ht,Wt)
     t = t_tokens.transpose(0, 1).contiguous().reshape(-1, Ht, Wt)  # (Dt,Ht,Wt)
 
     # Per-pixel cosine similarity over channel dimension
-    # cos_map: (Ht,Wt)
-    s_n = F.normalize(s, dim=0)  # normalize across channels
+    # Normalize across channels (dim=0 because tensor is (Dt,H,W))
+    s_n = F.normalize(s, dim=0)
     t_n = F.normalize(t, dim=0)
-    cos_map = (s_n * t_n).sum(dim=0)              # [-1,1]
-    cos_map01 = (cos_map + 1.0) * 0.5             # [0,1]
+    cos_map = (s_n * t_n).sum(dim=0)              # (Ht,Wt) in [-1,1]
+    cos_map01 = (cos_map + 1.0) * 0.5             # [0,1] for visualization
 
     # Per-pixel L2 error over channel dimension
-    l2_map = torch.sqrt(((s - t) ** 2).sum(dim=0) + 1e-8)          # >=0
+    l2_map = torch.sqrt(((s - t) ** 2).sum(dim=0) + 1e-8)          # (Ht,Wt) >=0
     l2_map01 = _to_01(l2_map)
 
     # Make 1-channel images (C,H,W)
     cos_img = cos_map01.unsqueeze(0).clamp(0, 1)   # (1,H,W)
     l2_img = l2_map01.unsqueeze(0).clamp(0, 1)     # (1,H,W)
 
-    # Upsample to max 512 on longer side (keeping aspect)
+    # Upsample to max_side on longer side (keeping aspect) for the heatmaps
     H, W = cos_img.shape[-2], cos_img.shape[-1]
     scale = min(1.0, float(max_side) / float(max(H, W)))
     if scale < 1.0:
@@ -203,17 +315,28 @@ def log_spatial_compare_first_sample(
     zero = torch.zeros_like(cos_img)
     rgb = torch.cat([cos_img, l2_img, zero], dim=0).clamp(0, 1)  # (3,H,W)
 
-    # Log images
+    # Log heatmaps
     tb_writer.add_image(f"{tag_prefix}/cosine_map", cos_img, global_step=step)
     tb_writer.add_image(f"{tag_prefix}/l2_map", l2_img, global_step=step)
     tb_writer.add_image(f"{tag_prefix}/cos_l2_rgb", rgb, global_step=step)
 
-    # Log scalars for first sample
-    tb_writer.add_scalar(f"{tag_prefix}/cosine_mean", cos_map.mean().item(), step)      # mean in [-1,1]
+    # Log scalars (note: cos_map is in [-1,1], not remapped)
+    tb_writer.add_scalar(f"{tag_prefix}/cosine_mean", cos_map.mean().item(), step)
     tb_writer.add_scalar(f"{tag_prefix}/cosine_min",  cos_map.min().item(), step)
     tb_writer.add_scalar(f"{tag_prefix}/cosine_max",  cos_map.max().item(), step)
     tb_writer.add_scalar(f"{tag_prefix}/l2_mean",     l2_map.mean().item(), step)
     tb_writer.add_scalar(f"{tag_prefix}/l2_p95",      torch.quantile(l2_map.flatten(), 0.95).item(), step)
+
+    # NEW: side-by-side channel grid (student | teacher)
+    if log_channel_grid:
+        grid = _make_side_by_side_channel_grid(
+            s_bdhw=s.detach().cpu(),
+            t_bdhw=t.detach().cpu(),
+            max_px=channel_grid_max_px,
+            max_channels=channel_grid_max_channels,
+            padding=2
+        )
+        tb_writer.add_image(f"{tag_prefix}/side_by_side_grid", grid, global_step=step, dataformats="CHW")
 
 
 
@@ -232,19 +355,36 @@ class TarShardDataset(IterableDataset):
         self.shuffle_shards = shuffle_shards
         self.seed = seed
 
-    def _iter_tar(self, tar_path: str) -> Iterator[Tuple[bytes, dict]]:
+    def _iter_tar(self, tar_path: str):
+        import io
         with tarfile.open(tar_path, "r") as tf:
             members = tf.getmembers()
-            # collect base keys that have both .img and .pt
             imgs = {m.name[:-4] for m in members if m.name.endswith(".img")}
-            pts  = {m.name[:-3] for m in members if m.name.endswith(".pt")}
+            pts = {m.name[:-3] for m in members if m.name.endswith(".pt")}
             keys = sorted(list(imgs.intersection(pts)))
+
             for k in keys:
-                img_m = tf.getmember(k + ".img")
-                pt_m  = tf.getmember(k + ".pt")
-                img_bytes = tf.extractfile(img_m).read()
-                payload = torch.load(tf.extractfile(pt_m), map_location="cpu", weights_only=False)
-                yield img_bytes, payload
+                try:
+                    img_m = tf.getmember(k + ".img")
+                    pt_m = tf.getmember(k + ".pt")
+
+                    img_f = tf.extractfile(img_m)
+                    pt_f = tf.extractfile(pt_m)
+                    if img_f is None or pt_f is None:
+                        continue
+
+                    img_bytes = img_f.read()
+
+                    # IMPORTANT: buffer the .pt into BytesIO before torch.load
+                    pt_bytes = pt_f.read()
+                    payload = torch.load(io.BytesIO(pt_bytes), map_location="cpu", weights_only=False)
+
+                    yield img_bytes, payload
+                except Exception as e:
+                    # skip corrupted members instead of killing the run
+                    # (optional) print once in a while:
+                    # print(f"[WARN] tar read failed {tar_path} key={k}: {e}")
+                    continue
 
     def __iter__(self):
         # split shards across workers
@@ -277,11 +417,14 @@ class SummaryHead(nn.Module):
 class SpatialHead(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False)
-        self.gn = nn.GroupNorm(num_groups=min(32, out_dim), num_channels=out_dim)
+        self.conv = nn.Conv2d(in_dim, out_dim, 1, bias=False)
+        self.ln = nn.LayerNorm(out_dim)
 
-    def forward(self, x_bchw):
-        return self.gn(self.conv(x_bchw))
+    def forward(self, x):
+        y = self.conv(x)                 # (B,Dt,H,W)
+        y = y.permute(0,2,3,1)           # (B,H,W,Dt)
+        y = self.ln(y)
+        return y.permute(0,3,1,2)        # (B,Dt,H,W)
 
 
 # -------------------- losses + metrics --------------------
@@ -342,23 +485,17 @@ def evaluate(student, sum_head, sp_head, dl, device, amp, Dt, Ht, Wt, tb_writer,
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
         with torch.amp.autocast("cuda", enabled=amp):
-            feat = student(x)[0]  # (B, Cs, Hs, Ws)
-            s_sp = sp_head(feat)  # (B, Dt, Hs, Ws)
-            s_sp = F.interpolate(s_sp, size=(Ht, Wt), mode="bilinear", align_corners=False)
-            s_tokens = spatial_to_tokens(s_sp)  # (B, T, Dt)
-            log_spatial_compare_first_sample(
-                tb_writer=tb_writer,
-                step=step,
-                s_spatial_bdhw=s_sp,  # your student spatial map aligned to teacher grid
-                t_tokens_btd=t_spatial_tokens,  # teacher cached tokens
-                Ht=Ht,
-                Wt=Wt,
-                tag_prefix="eval/spatial_compare_first",
-                max_side=512,
-            )
+            f2, f3 = student(x)
 
-            s_pool = feat.mean(dim=(-2, -1))
-            s_sum = sum_head(s_pool)  # (B, Ct)
+            assert f2.shape[-2:] == (Ht, Wt), f"stage2 shape {f2.shape[-2:]} != {(Ht, Wt)}"
+            s_sp = sp_head(f2)
+            norm = s_sp.norm(dim=1, keepdim=True).clamp_min(1e-6)  # (B,1,H,W)
+            scale = (50.0 / norm).clamp_max(1.0)
+            s_sp = s_sp * scale
+            s_tokens = spatial_to_tokens(s_sp)
+
+            s_pool = f3.mean(dim=(-2, -1))
+            s_sum = sum_head(s_pool)
 
             cos_sum = cosine_loss(s_sum, t_summary)
             cos_sp = cosine_loss_spatial_tokens(s_tokens, t_spatial_tokens)
@@ -371,11 +508,46 @@ def evaluate(student, sum_head, sp_head, dl, device, amp, Dt, Ht, Wt, tb_writer,
 
             loss = lambda_summary * loss_sum + lambda_spatial * loss_sp
 
+            if bi % 3 == 0 and bi < 15:  # first few batches only
+                # s_sp: (B, Dt, Ht, Wt)   t_tokens: (B, T, Dt)
+                s0 = s_sp[0]  # (Dt,Ht,Wt)
+                t0 = t_spatial_tokens[0].transpose(0, 1).contiguous().reshape(Dt, Ht, Wt)
+
+                l2 = torch.sqrt(((s0 - t0) ** 2).sum(dim=0) + 1e-8)  # (Ht,Wt)
+                flat = l2.flatten()
+                k = flat.argmax().item()
+                hh, ww = divmod(k, Wt)
+
+                s_vec = s0[:, hh, ww]
+                t_vec = t0[:, hh, ww]
+                s_norm = s_tokens[0].norm(dim=-1)  # (T,)
+                t_norm = t_spatial_tokens[0].norm(dim=-1)
+                print("HOT (h,w)=", (hh, ww),
+                      "l2=", l2[hh, ww].item(),
+                      "cos=", F.cosine_similarity(s_vec, t_vec, dim=0).item(),
+                      "||s||=", s_vec.norm().item(),
+                      "||t||=", t_vec.norm().item(),
+                      "t_norm max/p95/mean:", t_norm.max().item(), torch.quantile(t_norm, 0.95).item(),
+                      t_norm.mean().item(),
+                      "s_norm max/p95/mean:", s_norm.max().item(), torch.quantile(s_norm, 0.95).item(),
+                      s_norm.mean().item()
+                      )
+                log_spatial_compare_first_sample(
+                    tb_writer=tb_writer,
+                    step=step,
+                    s_spatial_bdhw=s_sp,  # your student spatial map aligned to teacher grid
+                    t_tokens_btd=t_spatial_tokens,  # teacher cached tokens
+                    Ht=Ht,
+                    Wt=Wt,
+                    tag_prefix=f"eval/spatial_compare_{bi}_first",
+                    max_side=512,
+                )
+
         agg["loss"] += loss.item()
         agg["loss_sum"] += loss_sum.item()
         agg["loss_sp"] += loss_sp.item()
-        agg["cos_sum"] += (1.0 - loss_sum.item())
-        agg["cos_sp"] += (1.0 - loss_sp.item())
+        agg["cos_sum"] += (1.0 - cos_sum.item())
+        agg["cos_sp"] += (1.0 - cos_sp.item())
         agg["mse_sum"] += mse_sum.item()
         agg["mse_sp"] += mse_sp.item()
         n += 1
@@ -432,8 +604,7 @@ def evaluate(student, sum_head, sp_head, dl, device, amp, Dt, Ht, Wt, tb_writer,
             s_energy = _spatial_energy(s_sp)  # (B,)
             # build teacher spatial map for energy (B,Dt,Ht,Wt)
             B, T, Dt = t_tokens.shape
-            HtWt = int(math.sqrt(T))
-            t_map = t_tokens.transpose(1, 2).contiguous().reshape(B, Dt, HtWt, HtWt)
+            t_map = t_tokens.transpose(1, 2).contiguous().reshape(B, Dt, Ht, Wt)
             t_energy = _spatial_energy(t_map)
             tb_writer.add_scalar("val/spatial_energy_ratio_mean",
                                  (s_energy / (t_energy + 1e-8)).mean().item(), step)
@@ -483,7 +654,7 @@ def main():
     ap.add_argument("--amp", type=bool, default=True)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--log_every", type=int, default=50)
-    ap.add_argument("--eval_every", type=int, default=500)
+    ap.add_argument("--eval_every", type=int, default=100)
     ap.add_argument("--eval_batches", type=int, default=50, help="How many val batches to eval each time")
     ap.add_argument('--exp_root', type=Path, default='/home/burplord/experiments/')
     ap.add_argument("--seed", type=int, default=42)
@@ -517,6 +688,7 @@ def main():
         eval_every = 5
         eval_batches = 5
         persistent_workers = False
+        prefetch_factor = None
         print(f"[DEBUG] Using train_shards={len(train_shards)} val_shards={len(val_shards)}")
     else:
         print(f"[FULL] Using train_shards={len(train_shards)} val_shards={len(val_shards)}")
@@ -536,7 +708,7 @@ def main():
         student_name,
         pretrained=True,
         features_only=True,
-        out_indices=(3,),
+        out_indices=(2, 3),
     ).to(device)
     if args.grad_checkpointing:
         if hasattr(student, "set_grad_checkpointing"):
@@ -561,11 +733,12 @@ def main():
 
     # Student dims
     with torch.no_grad():
-        feat = student(torch.randn(1, 3, args.size, args.size, device=device))[0]
-        Cs = feat.shape[1]
+        f2, f3 = student(torch.randn(1, 3, args.size, args.size, device=device))
+        Cs_sp = f2.shape[1]
+        Cs = f3.shape[1]
 
-    sum_head = SummaryHead(Cs, Ct).to(device)
-    sp_head = SpatialHead(Cs, Dt).to(device)
+    sum_head = SummaryHead(Cs, Ct).to(device)  # stage3 -> summary
+    sp_head = SpatialHead(Cs_sp, Dt).to(device)  # stage2 -> spatial
 
     # Transform and loaders
     collate_fn = make_collate(size=args.size)
@@ -608,7 +781,7 @@ def main():
     checkpoint_dir = exp_dir / 'checkpoints'
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    best_val_loss = 0.0
+    best_val_loss = None
 
     for ep in range(args.epochs):
         ep_t0 = time.time()
@@ -618,16 +791,19 @@ def main():
             t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
             with torch.amp.autocast("cuda", enabled=args.amp):
-                feat = student(x)[0]  # (B, Cs, Hs, Ws)
+                f2, f3 = student(x)  # f2: (B, Cs_sp, 26, 26)  f3: (B, Cs, 13, 13)
 
-                # spatial
-                s_sp = sp_head(feat)  # (B, Dt, Hs, Ws)
-                s_sp = F.interpolate(s_sp, size=(Ht, Wt), mode="bilinear", align_corners=False)
-                s_tokens = spatial_to_tokens(s_sp)  # (B, T, Dt)
+                # spatial from stage2 (should already be 26x26 for 416 input)
+                assert f2.shape[-2:] == (Ht, Wt), f"stage2 shape {f2.shape[-2:]} != {(Ht, Wt)}"
+                s_sp = sp_head(f2)  # (B, Dt, 26, 26)
+                norm = s_sp.norm(dim=1, keepdim=True).clamp_min(1e-6)  # (B,1,H,W)
+                scale = (50.0 / norm).clamp_max(1.0)
+                s_sp = s_sp * scale
+                s_tokens = spatial_to_tokens(s_sp)  # (B, 676, Dt)
 
-                # summary from pooled features
-                s_pool = feat.mean(dim=(-2, -1))
-                s_sum = sum_head(s_pool)
+                # summary from stage3
+                s_pool = f3.mean(dim=(-2, -1))  # (B, Cs)
+                s_sum = sum_head(s_pool)  # (B, Ct)
 
                 # --- cosine losses ---
                 cos_sum = cosine_loss(s_sum, t_summary)
@@ -648,7 +824,16 @@ def main():
 
             scaler.scale(loss).backward()
 
-            if (it + 1) % grad_accum == 0:
+            if (it + 1) % args.grad_accum == 0:
+                scaler.unscale_(opt)
+
+                torch.nn.utils.clip_grad_norm_(
+                    list(student.parameters()) +
+                    list(sum_head.parameters()) +
+                    list(sp_head.parameters()),
+                    max_norm=1.0,
+                )
+
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
@@ -674,6 +859,11 @@ def main():
                     f"loss_sum={running['loss_sum'] / denom:.4f} "
                     f"loss_sp={running['loss_sp'] / denom:.4f}"
                 )
+                # print(f'ep={ep} it={it} step={step} Shapes: '
+                #       f't_sum:{t_summary.shape}, t_spatial_tokens:{t_spatial_tokens.shape}, '
+                #       f's_sum: {s_sum.shape}, s_spatial_tokens: {s_tokens.shape}, s_spatial: {s_sp.shape}'
+                #       f'f2: {f2.shape}, f3: {f3.shape}')
+
             tb_writer.add_scalar("train_loss", running['loss']/denom, step)
             tb_writer.add_scalar("train_cos_sum", running['cos_sum']/denom, step)
             tb_writer.add_scalar("train_cos_sp", running['cos_sp']/denom, step)
@@ -713,7 +903,7 @@ def main():
                 tb_writer.add_scalar("val_mse_sum", metrics['mse_sum'], step)
                 tb_writer.add_scalar("val_mse_sp", metrics['mse_sp'], step)
 
-                if best_val_loss > metrics['loss']:
+                if (best_val_loss is None) or (best_val_loss > metrics['loss']):
                     best_val_loss = metrics['loss']
                     save_path = checkpoint_dir / f'epoch_{ep}_step_{step}_val_loss_{metrics['loss']:.3f}.pth'
                     torch.save(
