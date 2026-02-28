@@ -44,6 +44,7 @@ class TrainConfig:
     eval_batches: int = 50
 
     exp_root: Path = Path("/home/burplord/experiments/")
+    exp_suffix: str = ""
     seed: int = 42
     lambda_summary: float = 1.0
     lambda_spatial: float = 1.0
@@ -51,6 +52,14 @@ class TrainConfig:
 
     grad_checkpointing: bool = False
 
+    mse_sp_w_start: float = 0.5
+    mse_sp_w_end: float = 1.5
+    mse_sp_w_warmup_frac: float = 0.2
+    grad_w_start: float = 0.1
+    grad_w_end: float = 0.3
+    grad_w_warmup_frac: float = 0.35
+
+    grad_eps: float = 1e-3
 
 def pick_student_name(variant: str) -> str:
     if variant == "tiny":
@@ -62,7 +71,7 @@ def pick_student_name(variant: str) -> str:
 
 def infer_teacher_dims(train_ds: IterableDataset, size: int, patch_size: int) -> Tuple[int, int, int, int]:
     first_payload = None
-    for _, payload in train_ds:
+    for _, payload, _ in train_ds:
         first_payload = payload
         break
     if first_payload is None:
@@ -93,6 +102,7 @@ def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Tuple[int, 
         eval_batches = 5
         persistent_workers = False
         prefetch_factor = None
+        cfg.exp_suffix = 'debug' if cfg.exp_suffix == '' else cfg.exp_suffix + '_debug'
         print(f"[DEBUG] Using train_shards={len(train_shards)} val_shards={len(val_shards)}")
     else:
         print(f"[FULL] Using train_shards={len(train_shards)} val_shards={len(val_shards)}")
@@ -204,7 +214,7 @@ class DistillRunner:
             lambda_mse=cfg.lambda_mse,
         )
 
-        exp_dir = cfg.exp_root / f"exp_{time.strftime('%Y%m%d%H%M')}"
+        exp_dir = cfg.exp_root / f"exp_{time.strftime('%Y%m%d%H%M')}_{cfg.exp_suffix}"
         self.tb_writer = SummaryWriter(log_dir=exp_dir / "tb")
         self.checkpoint_dir = exp_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +225,8 @@ class DistillRunner:
 
         for ep in range(self.cfg.epochs):
             ep_t0 = time.time()
+
+            self.train_dl.dataset.set_epoch(ep)
 
             step, best_val_loss = train_one_epoch(
                 model=self.model,
@@ -240,6 +252,13 @@ class DistillRunner:
                 size=self.cfg.size,
                 patch_size=self.cfg.patch_size,
                 best_val_loss=best_val_loss,
+                mse_sp_w_start=self.cfg.mse_sp_w_start,
+                mse_sp_w_end=self.cfg.mse_sp_w_end,
+                mse_sp_w_warmup_frac=self.cfg.mse_sp_w_warmup_frac,
+                grad_w_start=self.cfg.grad_w_start,
+                grad_w_end=self.cfg.grad_w_end,
+                grad_w_warmup_frac=self.cfg.grad_w_warmup_frac,
+                grad_eps=self.cfg.grad_eps,
             )
 
             self.tb_writer.add_scalar("epoch", ep, step)
@@ -267,7 +286,7 @@ def parse_args() -> TrainConfig:
     ap.set_defaults(persistent_workers=True)
     ap.add_argument("--prefetch_factor", type=int, default=8)
 
-    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=1.5e-4)
     ap.add_argument("--wd", type=float, default=0.08)
     ap.add_argument("--amp", action="store_true")
@@ -276,17 +295,26 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--grad_accum", type=int, default=4)
 
     ap.add_argument("--log_every", type=int, default=50)
-    ap.add_argument("--eval_every", type=int, default=100)
+    ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--eval_batches", type=int, default=50)
 
     ap.add_argument("--exp_root", type=Path, default=Path("/home/burplord/experiments/"))
+    ap.add_argument('--exp_suffix', type=str, default='')
     ap.add_argument("--seed", type=int, default=42)
 
     ap.add_argument("--lambda_summary", type=float, default=1.0)
     ap.add_argument("--lambda_spatial", type=float, default=1.0)
-    ap.add_argument("--lambda_mse", type=float, default=0.05)
+    ap.add_argument("--lambda_mse", type=float, default=0.25)
 
     ap.add_argument("--grad_checkpointing", action="store_true")
+    ap.add_argument("--mse_sp_w_start", type=float, default=0.5)
+    ap.add_argument("--mse_sp_w_end", type=float, default=1.5)
+    ap.add_argument("--mse_sp_w_warmup_frac", type=float, default=0.2)  # first 20% of training
+    ap.add_argument("--grad_w_start", type=float, default=0.1)
+    ap.add_argument("--grad_w_end", type=float, default=1.3)
+    ap.add_argument("--grad_w_warmup_frac", type=float, default=0.35)  # first 20% of training
+
+    ap.add_argument("--grad_eps", type=float, default=1e-3)  # Charbonnier eps
 
     a = ap.parse_args()
     return TrainConfig(**vars(a))

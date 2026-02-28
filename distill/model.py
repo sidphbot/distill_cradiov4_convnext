@@ -4,6 +4,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import functional as F
 
 
 # ============================================================
@@ -78,12 +79,6 @@ def cosine_loss_spatial_tokens(s_tokens, t_tokens):
 
 def mse_loss(a, b):
     return F.mse_loss(a, b)
-
-
-def mse_loss_spatial_tokens(s_tokens, t_tokens):
-    B, T, D = s_tokens.shape
-    return mse_loss(s_tokens.reshape(B * T, D), t_tokens.reshape(B * T, D))
-
 
 # ---- debug/metrics helpers (kept as-is, just grouped) ----
 
@@ -344,3 +339,51 @@ class DistillModel(nn.Module):
         s_pool = f3.mean(dim=(-2, -1))
         s_sum = self.sum_head(s_pool)  # (B,Ct)
         return s_sum, s_tokens, s_sp, (f2, f3)
+
+
+def charbonnier(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    # robust L1-like
+    return torch.sqrt(x * x + eps * eps)
+
+
+@torch.no_grad()
+def make_sobel_kernels(device, dtype):
+    # 3x3 Sobel kernels (normalized-ish)
+    kx = torch.tensor([[-1., 0., 1.],
+                       [-2., 0., 2.],
+                       [-1., 0., 1.]], device=device, dtype=dtype) / 8.0
+    ky = torch.tensor([[-1., -2., -1.],
+                       [ 0.,  0.,  0.],
+                       [ 1.,  2.,  1.]], device=device, dtype=dtype) / 8.0
+    # shape for conv2d with groups=C: (C,1,3,3) will be created later
+    return kx, ky
+
+
+def sobel_grad_loss(
+    s: torch.Tensor,
+    t: torch.Tensor,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Edge-aware loss on feature maps using Sobel gradients.
+    s,t: (B,C,H,W)
+    """
+    assert s.shape == t.shape and s.ndim == 4
+
+    B, C, H, W = s.shape
+    device, dtype = s.device, s.dtype
+
+    kx, ky = make_sobel_kernels(device, dtype)
+    kx = kx.view(1, 1, 3, 3).repeat(C, 1, 1, 1)  # (C,1,3,3)
+    ky = ky.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+
+    # depthwise conv
+    sx = F.conv2d(s, kx, padding=1, groups=C)
+    sy = F.conv2d(s, ky, padding=1, groups=C)
+    tx = F.conv2d(t, kx, padding=1, groups=C)
+    ty = F.conv2d(t, ky, padding=1, groups=C)
+
+    # robust difference
+    dx = charbonnier(sx - tx, eps=eps).mean()
+    dy = charbonnier(sy - ty, eps=eps).mean()
+    return dx + dy

@@ -50,6 +50,10 @@ class TarShardDataset(IterableDataset):
         self.shard_paths = list(shard_paths)
         self.shuffle_shards = shuffle_shards
         self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
 
     def _iter_tar(self, tar_path: str):
         with tarfile.open(tar_path, "r") as tf:
@@ -74,7 +78,7 @@ class TarShardDataset(IterableDataset):
                     pt_bytes = pt_f.read()
                     payload = torch.load(io.BytesIO(pt_bytes), map_location="cpu", weights_only=False)
 
-                    yield img_bytes, payload
+                    yield img_bytes, payload, k
                 except Exception:
                     continue
 
@@ -83,7 +87,8 @@ class TarShardDataset(IterableDataset):
         shard_paths = self.shard_paths
 
         if self.shuffle_shards:
-            rng = random.Random(self.seed + (worker.id if worker else 0))
+            wid = worker.id if worker else 0
+            rng = random.Random(self.seed + 1000 * self.epoch + wid)
             rng.shuffle(shard_paths)
 
         if worker is not None:
@@ -95,13 +100,14 @@ class TarShardDataset(IterableDataset):
 
 def make_collate(size: int = 416):
     def _collate(batch):
-        xs, t_summ, t_spat = [], [], []
-        for img_bytes, payload in batch:
+        xs, t_summ, t_spat, keys = [], [], [], []
+        for img_bytes, payload, key in batch:
             img_u8 = decode_image_bytes_fast(img_bytes)
             xs.append(preprocess_uint8(img_u8, size=size))
             t_summ.append(payload["summary"])
             t_spat.append(payload["spatial_tokens"])
-        return torch.stack(xs), torch.stack(t_summ), torch.stack(t_spat)
+            keys.append(key)
+        return torch.stack(xs), torch.stack(t_summ), torch.stack(t_spat), keys
 
     return _collate
 

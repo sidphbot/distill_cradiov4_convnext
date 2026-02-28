@@ -1,0 +1,11 @@
+**/__pycache__/
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+.idea/
+lightning_logs/
+*.log
+# (optional) If you use pip editable installs, also ignore:
+pip-wheel-metadata/
