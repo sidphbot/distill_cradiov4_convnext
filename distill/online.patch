@@ -1,0 +1,538 @@
+--- data.py
++++ data.py
+@@ -3,6 +3,7 @@
+ import os
+ import random
+ import tarfile
++import hashlib
+ from typing import List, Tuple
+ 
+ import torch
+ import torchvision
+ import torchvision.transforms.functional as TF
+ from torch.utils.data import IterableDataset
+ from torchvision.io import decode_jpeg
+ from torchvision.transforms import InterpolationMode
++from PIL import Image
+
+
+ # ============================================================
+ # DATA
+ # ============================================================
+@@ -30,6 +31,92 @@
+     x = TF.normalize(x, mean=mean, std=std)
+     return x
+
+
++# ============================================================
++# ONLINE DATA (image path list)
++# ============================================================
++
++def read_image_list(list_file: str) -> List[str]:
++    paths: List[str] = []
++    with open(list_file, "r", encoding="utf-8") as f:
++        for ln in f:
++            s = ln.strip()
++            if not s or s.startswith("#"):
++                continue
++            paths.append(s)
++    if not paths:
++        raise RuntimeError(f"No image paths found in {list_file}")
++    return paths
++
++
++def _stable_hash01(s: str) -> float:
++    h = hashlib.md5(s.encode("utf-8")).hexdigest()
++    x = int(h[:8], 16) / 0xFFFFFFFF
++    return float(x)
++
++
++def split_paths_deterministic(paths: List[str], val_frac: float, seed: int) -> Tuple[List[str], List[str]]:
++    train: List[str] = []
++    val: List[str] = []
++    for p in paths:
++        x = _stable_hash01(f"{seed}:{p}")
++        (val if x < val_frac else train).append(p)
++    if not train or not val:
++        raise RuntimeError(f"Split produced empty train/val (val_frac={val_frac}).")
++    return train, val
++
++
++class ImagePathDataset(torch.utils.data.Dataset):
++    def __init__(self, paths: List[str]):
++        self.paths = list(paths)
++
++    def __len__(self) -> int:
++        return len(self.paths)
++
++    def __getitem__(self, idx: int) -> str:
++        return self.paths[idx]
++
++
++def make_online_collate(
++        size: int = 416,
++        mean=(0.485, 0.456, 0.406),
++        std=(0.229, 0.224, 0.225),
++):
++    """
++    Online distill collate.
++
++    Returns:
++      x: (B,3,size,size) float32 normalized (student input)
++      pil_rs: List[PIL.Image] resized to (size,size) for teacher proc(do_resize=False)
++      keys: List[str] file paths (used as IDs)
++    """
++    def _collate(batch):
++        xs, pil_rs, keys = [], [], []
++        for p in batch:
++            try:
++                with open(p, "rb") as f:
++                    img_bytes = f.read()
++                pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
++                pil = pil.resize((size, size), resample=Image.BICUBIC)
++
++                img_u8 = TF.pil_to_tensor(pil)  # (C,H,W) uint8
++                x = img_u8.float().div(255.0)
++                x = TF.normalize(x, mean=mean, std=std)
++
++                xs.append(x)
++                pil_rs.append(pil)
++                keys.append(p)
++            except Exception:
++                continue
++
++        if not xs:
++            raise RuntimeError("All samples in batch failed to load.")
++        return torch.stack(xs), pil_rs, keys
++
++    return _collate
++
++
+ class TarShardDataset(IterableDataset):
+     """
+     Streams samples from a list of .tar shards.
+     Each sample has:
+       {key}.img  (raw image bytes)
+       {key}.pt   (torch payload dict with summary + spatial_tokens)
+     """
+--- launcher.py
++++ launcher.py
+@@ -6,12 +6,13 @@
+ from pathlib import Path
+ from typing import Tuple
+
+ import timm
+ import torch
++from transformers import AutoModel, CLIPImageProcessor
+ from torch.utils.data import IterableDataset, DataLoader
+ from torch.utils.tensorboard import SummaryWriter
+
+-from distill.data import find_shards, TarShardDataset, make_collate
++from distill.data import find_shards, TarShardDataset, make_collate, read_image_list, split_paths_deterministic, ImagePathDataset, make_online_collate
+ from distill.loop import LossWeights, train_one_epoch
+ from distill.model import DistillModel, SummaryHead, SpatialHead, build_param_groups
+
+@@ -19,8 +20,14 @@
+ # ============================================================
+
+ @dataclass
+ class TrainConfig:
+-    cache_dir: str
++    cache_dir: str = ""  # cache mode
++    distill_mode: str = "cache"  # cache|online
++    data_list: str = ""  # online mode list file
++    val_frac: float = 0.02
++    teacher_id: str = "nvidia/C-RADIOv4-H"
++    teacher_amp: bool = True
+     student_variant: str = "small"  # tiny|small
+     mode: str = "debug"  # debug|full
+     debug_train_shards: int = 2
+@@ -58,7 +65,7 @@
+     raise ValueError(f"Unknown student_variant={variant}")
+
+
+-def infer_teacher_dims(train_ds: IterableDataset, size: int, patch_size: int) -> Tuple[int, int, int, int]:
++def infer_teacher_dims_cache(train_ds: IterableDataset, size: int, patch_size: int) -> Tuple[int, int, int, int]:
+     first_payload = None
+     for _, payload, _ in train_ds:
+         first_payload = payload
+@@ -99,9 +106,9 @@
+     Ht = size // patch_size
+     Wt = size // patch_size
+     assert Tt == Ht * Wt, f"Teacher token count T={Tt} != {Ht}*{Wt} (check size/patch_size)"
+     return Ct, Dt, Ht, Wt
+
+
+-def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Tuple[int, int, int, int], str]:
++def build_loaders_cache(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Tuple[int, int, int, int], str]:
+     train_shards, val_shards = find_shards(cfg.cache_dir)
+
+     num_workers = cfg.num_workers
+@@ -133,7 +140,7 @@
+     val_ds = TarShardDataset(val_shards, shuffle_shards=False, seed=cfg.seed)
+
+     # teacher dims
+-    Ct, Dt, Ht, Wt = infer_teacher_dims(train_ds, cfg.size, cfg.patch_size)
++    Ct, Dt, Ht, Wt = infer_teacher_dims_cache(train_ds, cfg.size, cfg.patch_size)
+
+     collate_fn = make_collate(size=cfg.size)
+
+@@ -173,6 +180,85 @@
+     student_name = pick_student_name(cfg.student_variant)
+     return train_dl, val_dl, (Ct, Dt, Ht, Wt), student_name
+
+
++def build_loaders_online(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, str]:
++    all_paths = read_image_list(cfg.data_list)
++    train_paths, val_paths = split_paths_deterministic(all_paths, val_frac=cfg.val_frac, seed=cfg.seed)
++
++    num_workers = cfg.num_workers
++    eval_every = cfg.eval_every
++    eval_batches = cfg.eval_batches
++    persistent_workers = cfg.persistent_workers
++    prefetch_factor = cfg.prefetch_factor
++
++    if cfg.mode == "debug":
++        train_paths = train_paths[:5000]
++        val_paths = val_paths[:1000]
++        num_workers = 0
++        eval_every = 5
++        eval_batches = 5
++        persistent_workers = False
++        prefetch_factor = None
++        cfg.exp_suffix = 'debug' if cfg.exp_suffix == '' else cfg.exp_suffix + '_debug'
++        print(f"[DEBUG][ONLINE] train={len(train_paths)} val={len(val_paths)}")
++    else:
++        print(f"[FULL][ONLINE] train={len(train_paths)} val={len(val_paths)}")
++
++    train_ds = ImagePathDataset(train_paths)
++    val_ds = ImagePathDataset(val_paths)
++
++    collate_fn = make_online_collate(size=cfg.size)
++
++    train_dl = DataLoader(
++        train_ds,
++        batch_size=cfg.batch_size,
++        shuffle=True,
++        num_workers=num_workers,
++        pin_memory=True,
++        collate_fn=collate_fn,
++        persistent_workers=persistent_workers,
++        prefetch_factor=prefetch_factor,
++    )
++    val_dl = DataLoader(
++        val_ds,
++        batch_size=cfg.batch_size,
++        shuffle=False,
++        num_workers=num_workers,
++        pin_memory=True,
++        collate_fn=collate_fn,
++        persistent_workers=persistent_workers,
++        prefetch_factor=prefetch_factor,
++    )
++
++    cfg.eval_every = eval_every
++    cfg.eval_batches = eval_batches
++    cfg.num_workers = num_workers
++    cfg.persistent_workers = persistent_workers
++    cfg.prefetch_factor = prefetch_factor if prefetch_factor is not None else 2
++
++    student_name = pick_student_name(cfg.student_variant)
++    return train_dl, val_dl, student_name
++
++
++@torch.no_grad()
++def infer_teacher_dims_online(
++    teacher,
++    proc,
++    train_dl: DataLoader,
++    device: str,
++    size: int,
++    patch_size: int,
++    teacher_amp: bool,
++) -> Tuple[int, int, int, int]:
++    # batch yields (x, pil_rs, keys)
++    _, pil_rs, _ = next(iter(train_dl))
++    pv = proc(images=pil_rs, return_tensors="pt", do_resize=False, do_center_crop=False).pixel_values.to(device)
++
++    if device.startswith("cuda"):
++        with torch.amp.autocast("cuda", enabled=teacher_amp):
++            summary, spatial_tokens = teacher(pv)
++    else:
++        summary, spatial_tokens = teacher(pv)
++
++    Ct = int(summary.shape[-1])
++    Tt = int(spatial_tokens.shape[1])
++    Dt = int(spatial_tokens.shape[-1])
++    Ht = size // patch_size
++    Wt = size // patch_size
++    assert Tt == Ht * Wt, f"Teacher token count T={Tt} != {Ht}*{Wt} (check size/patch_size/teacher proc)"
++    return Ct, Dt, Ht, Wt
++
++
+ def build_model_and_optim(
+         cfg: TrainConfig,
+         device: str,
+@@ -250,10 +336,30 @@
+         self.cfg = cfg
+         torch.manual_seed(cfg.seed)
+         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+         print(f"Device: {self.device}")
+
+-        self.train_dl, self.val_dl, dims, self.student_name = build_loaders(cfg)
+-        self.Ct, self.Dt, self.Ht, self.Wt = dims
++        self.teacher = None
++        self.teacher_proc = None
++
++        if cfg.distill_mode == "cache":
++            self.train_dl, self.val_dl, dims, self.student_name = build_loaders_cache(cfg)
++            self.Ct, self.Dt, self.Ht, self.Wt = dims
++        else:
++            self.teacher_proc = CLIPImageProcessor.from_pretrained(cfg.teacher_id)
++            self.teacher = AutoModel.from_pretrained(cfg.teacher_id, trust_remote_code=True).to(self.device).eval()
++            for p in self.teacher.parameters():
++                p.requires_grad_(False)
++
++            self.train_dl, self.val_dl, self.student_name = build_loaders_online(cfg)
++            self.Ct, self.Dt, self.Ht, self.Wt = infer_teacher_dims_online(
++                teacher=self.teacher,
++                proc=self.teacher_proc,
++                train_dl=self.train_dl,
++                device=self.device,
++                size=cfg.size,
++                patch_size=cfg.patch_size,
++                teacher_amp=cfg.teacher_amp,
++            )
+
+         self.model, self.opt, self.scaler = build_model_and_optim(
+             cfg=cfg,
+@@ -292,7 +398,8 @@
+
+         for ep in range(self.cfg.epochs):
+             ep_t0 = time.time()
+
+-            self.train_dl.dataset.set_epoch(ep)
++            if hasattr(self.train_dl.dataset, "set_epoch"):
++                self.train_dl.dataset.set_epoch(ep)
+
+             step, best_val_loss = train_one_epoch(
+                 model=self.model,
+@@ -334,6 +441,9 @@
+                 grad_w_end=self.cfg.grad_w_end,
+                 grad_w_warmup_frac=self.cfg.grad_w_warmup_frac,
+                 grad_eps=self.cfg.grad_eps,
++                teacher=self.teacher,
++                teacher_proc=self.teacher_proc,
++                teacher_amp=self.cfg.teacher_amp,
+             )
+
+             self.tb_writer.add_scalar("epoch", ep, step)
+             print(f"Epoch {ep} done in {(time.time() - ep_t0) / 60:.1f} min")
+@@ -350,7 +460,14 @@
+
+ def parse_args() -> TrainConfig:
+     ap = argparse.ArgumentParser()
+-    ap.add_argument("--cache_dir", type=str, required=True, help="Root cache dir containing train/ val/ test/")
++    ap.add_argument("--distill_mode", choices=["cache","online"], default="cache")
++    ap.add_argument("--cache_dir", type=str, default="", help="Root cache dir containing train/ val/ test/ (cache mode)")
++    ap.add_argument("--data_list", type=str, default="", help="Text file with one image path per line (online mode)")
++    ap.add_argument("--val_frac", type=float, default=0.02)
++    ap.add_argument("--teacher_id", type=str, default="nvidia/C-RADIOv4-H")
++    ap.add_argument("--teacher_amp", action="store_true")
++    ap.add_argument("--no_teacher_amp", dest="teacher_amp", action="store_false")
++    ap.set_defaults(teacher_amp=True)
+     ap.add_argument("--student_variant", type=str, default="small", choices=["tiny", "small"])
+     ap.add_argument("--mode", type=str, default="debug", choices=["debug", "full"])
+     ap.add_argument("--debug_train_shards", type=int, default=2)
+     ap.add_argument("--debug_val_shards", type=int, default=1)
+@@ -418,7 +535,14 @@
+
+
+ def main():
+     cfg = parse_args()
++    if cfg.distill_mode == "cache":
++        if not cfg.cache_dir:
++            raise SystemExit("--cache_dir is required for cache mode")
++    else:
++        if not cfg.data_list:
++            raise SystemExit("--data_list is required for online mode")
+     runner = DistillRunner(cfg)
+     runner.run()
+
+--- loop.py
++++ loop.py
+@@ -20,10 +20,10 @@
+
+ # loop.py
+ import torch
+ import torch.nn.functional as F
+
+-import torch
+-import torch.nn.functional as F
++from PIL import Image
+
+ def _pearson_corr_per_sample(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+     """
+     a,b: (B, N) -> returns (B,) Pearson correlation
+     """
+@@ -70,6 +70,35 @@
+ def hb(tag):
+     torch.cuda.synchronize()
+     print(f"[HB] {tag}", flush=True)
+
+
++@torch.no_grad()
++def teacher_forward_fixed(
++        teacher,
++        proc,
++        pil_imgs: list[Image.Image],
++        device: str,
++        *,
++        size: int = 416,
++        amp: bool = True,
++):
++    """
++    Match caching preprocessing:
++      - resize to (size,size) in PIL
++      - processor called with do_resize=False, do_center_crop=False
++      - teacher returns (summary, spatial_tokens) with spatial_tokens shape (B,T,Dt)
++    """
++    pil_rs = [im.resize((size, size), resample=Image.BICUBIC) for im in pil_imgs]
++    pv = proc(
++        images=pil_rs,
++        return_tensors="pt",
++        do_resize=False,
++        do_center_crop=False,
++    ).pixel_values.to(device, non_blocking=True)
++
++    if device.startswith("cuda"):
++        with torch.amp.autocast("cuda", enabled=amp):
++            summary, spatial_tokens = teacher(pv)
++    else:
++        summary, spatial_tokens = teacher(pv)
++
++    return summary, spatial_tokens
++
++
+ def tokens_to_map(x_tokens: torch.Tensor, H: int, W: int) -> torch.Tensor:
+     # Example: tokens are (B, HW, C). Adjust if yours is (B,C,HW).
+     B, HW, C = x_tokens.shape
+     assert HW == H * W
+@@ -221,6 +250,11 @@
+         tb_writer: SummaryWriter,
+         step: int,
+         w: LossWeights,
+         grad_eps: float,
+         max_batches: Optional[int] = None,
++        *,
++        teacher=None,
++        teacher_proc=None,
++        teacher_amp: bool = True,
++        size: int = 416,
+ ) -> Dict[str, float]:
+     model.eval()
+
+@@ -270,11 +304,29 @@
+         if max_batches is not None and bi >= max_batches:
+             break
+
+-        # Support both (x,t_sum,t_sp) and (x,t_sum,t_sp,extra)
+-        if len(batch) == 3:
+-            x, t_summary, t_spatial_tokens = batch
+-        else:
+-            x, t_summary, t_spatial_tokens, _ = batch
++        # Cache mode:
++        #   (x, t_summary, t_spatial_tokens) or (x, t_summary, t_spatial_tokens, keys)
++        # Online mode:
++        #   (x, pil_rs, keys)
++        if len(batch) >= 3 and torch.is_tensor(batch[1]):
++            if len(batch) == 3:
++                x, t_summary, t_spatial_tokens = batch
++            else:
++                x, t_summary, t_spatial_tokens, _ = batch
++        else:
++            x, pil_rs, _ = batch
++            if teacher is None or teacher_proc is None:
++                raise RuntimeError("Online eval requires teacher + teacher_proc")
++            t_summary, t_spatial_tokens = teacher_forward_fixed(
++                teacher=teacher,
++                proc=teacher_proc,
++                pil_imgs=pil_rs,
++                device=device,
++                size=size,
++                amp=teacher_amp,
++            )
+
+         x = x.to(device, non_blocking=True).float()
+         t_summary = t_summary.to(device, non_blocking=True).float()
+         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
+@@ -469,6 +521,9 @@
+         grad_w_end: float,
+         grad_w_warmup_frac: float,
+         grad_eps: float = 1e-3,
++        teacher=None,
++        teacher_proc=None,
++        teacher_amp: bool = True,
+ ) -> Tuple[int, Optional[float]]:
+     model.train()
+@@ -481,7 +536,23 @@
+         "loss_sum": 0.0, "loss_sp": 0.0, 'loss_grad': 0.0
+     }
+
+-    for it, (x, t_summary, t_spatial_tokens, keys) in tqdm(enumerate(train_dl), total=None):
++    for it, batch in tqdm(enumerate(train_dl), total=None):
++
++        if len(batch) >= 3 and torch.is_tensor(batch[1]):
++            x, t_summary, t_spatial_tokens, keys = batch
++        else:
++            x, pil_rs, keys = batch
++            if teacher is None or teacher_proc is None:
++                raise RuntimeError("Online train requires teacher + teacher_proc")
++            t_summary, t_spatial_tokens = teacher_forward_fixed(
++                teacher=teacher,
++                proc=teacher_proc,
++                pil_imgs=pil_rs,
++                device=device,
++                size=size,
++                amp=teacher_amp,
++            )
+         steps_per_epoch = 3800
+
+         w.lambda_sp_mse = ramp_linear(step=step, warmup_steps=int(mse_sp_w_warmup_frac * steps_per_epoch),
+@@ -580,7 +651,7 @@
+         if step > 0 and (step % eval_every == 0):
+             print("Evaluating..")
+             best_val_loss = evaluate_step(Dt, Ht, Wt, amp, best_val_loss, checkpoint_dir, device, ep, eval_batches,
+                                           grad_eps, model, w.lambda_sp_mse, patch_size, size, step, student_name, tb_writer,
+-                                          val_dl, w)
++                                          val_dl, w, teacher=teacher, teacher_proc=teacher_proc, teacher_amp=teacher_amp)
+
+     best_val_loss = evaluate_step(Dt, Ht, Wt, amp, best_val_loss, checkpoint_dir, device, ep, eval_batches,
+                                   grad_eps, model, w.lambda_sp_mse, patch_size, size, step, student_name, tb_writer,
+-                                  val_dl, w, force_save=True)
++                                  val_dl, w, force_save=True, teacher=teacher, teacher_proc=teacher_proc, teacher_amp=teacher_amp)
+
+     return step, best_val_loss
+
+@@ -589,7 +660,7 @@
+ def evaluate_step(Dt: int, Ht: int, Wt: int, amp: bool, best_val_loss: float | None, checkpoint_dir: Path, device: str,
+                   ep: int, eval_batches: int, grad_eps: float, model: DistillModel, mse_sp_w: float, patch_size: int,
+                   size: int, step: int, student_name: str, tb_writer: SummaryWriter, val_dl: DataLoader,
+-                  w: LossWeights, force_save: bool = False) -> float:
++                  w: LossWeights, force_save: bool = False, *, teacher=None, teacher_proc=None, teacher_amp: bool = True) -> float:
+     metrics = evaluate(
+         model=model,
+         dl=val_dl,
+@@ -605,7 +676,11 @@
+         step=step,
+         w=w,
+         max_batches=eval_batches,
+-        grad_eps=grad_eps
++        grad_eps=grad_eps,
++        teacher=teacher,
++        teacher_proc=teacher_proc,
++        teacher_amp=teacher_amp,
++        size=size,
+     )
+     print(
+         f"[VAL] step={step} "

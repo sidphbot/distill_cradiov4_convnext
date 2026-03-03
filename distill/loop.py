@@ -25,6 +25,30 @@ import torch.nn.functional as F
 import torch
 import torch.nn.functional as F
 
+from PIL import Image  # add at top
+
+@torch.no_grad()
+def teacher_forward_fixed(teacher, proc, pil_imgs: list[Image.Image], device: str, size: int = 416, amp: bool = True):
+    # pil_imgs are expected to already be resized to (size,size) in online collate,
+    # but we keep the resize here too for safety/compat (same as caching script intent).
+    pil_rs = [im.resize((size, size), resample=Image.BICUBIC) for im in pil_imgs]
+
+    pv = proc(
+        images=pil_rs,
+        return_tensors="pt",
+        do_resize=False,
+        do_center_crop=False,
+    ).pixel_values.to(device)
+
+    if amp and device.startswith("cuda"):
+        with torch.amp.autocast("cuda", enabled=True):
+            summary, spatial = teacher(pv)
+    else:
+        summary, spatial = teacher(pv)
+
+    # summary: (B,Ct), spatial: (B,T,Dt)
+    return summary, spatial
+
 def _pearson_corr_per_sample(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     a,b: (B, N) -> returns (B,) Pearson correlation
@@ -146,6 +170,7 @@ def evaluate(
         step: int,
         w: LossWeights,
         grad_eps: float,
+        size: int, teacher=None, teacher_proc=None, teacher_amp: bool = True,
         max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
     model.eval()
@@ -187,10 +212,29 @@ def evaluate(
             break
 
         # Support both (x,t_sum,t_sp) and (x,t_sum,t_sp,extra)
-        if len(batch) == 3:
-            x, t_summary, t_spatial_tokens = batch
+        # batch can be:
+        # cache:   (x, t_summary, t_spatial_tokens) or (x, t_summary, t_spatial_tokens, keys)
+        # online:  (x, pil_rs, keys)
+        if len(batch) >= 3 and torch.is_tensor(batch[1]):
+            # cache mode
+            if len(batch) == 3:
+                x, t_summary, t_spatial_tokens = batch
+            else:
+                x, t_summary, t_spatial_tokens, _ = batch
         else:
-            x, t_summary, t_spatial_tokens, _ = batch
+            # online mode
+            x, pil_rs, _ = batch
+            assert teacher is not None and teacher_proc is not None, "Online eval requires teacher + proc"
+            t_summary, t_spatial_tokens = teacher_forward_fixed(
+                teacher=teacher,
+                proc=teacher_proc,
+                pil_imgs=pil_rs,
+                device=device,
+                size=size,
+                amp=teacher_amp,
+            )
+            assert t_spatial_tokens.shape[1] == Ht * Wt, \
+                f"Teacher tokens T={t_spatial_tokens.shape[1]} != Ht*Wt={Ht * Wt}. Check resizing/proc."
 
         x = x.to(device, non_blocking=True).float()
         t_summary = t_summary.to(device, non_blocking=True).float()
@@ -388,6 +432,7 @@ def train_one_epoch(
         grad_w_end: float,
         grad_w_warmup_frac: float,
         grad_eps: float = 1e-3,
+        teacher=None, teacher_proc=None, teacher_amp: bool = True,
 ) -> Tuple[int, Optional[float]]:
     model.train()
 
@@ -398,7 +443,28 @@ def train_one_epoch(
         "loss_sum": 0.0, "loss_sp": 0.0, 'loss_grad': 0.0
     }
 
-    for it, (x, t_summary, t_spatial_tokens, keys) in tqdm(enumerate(train_dl), total=None):
+    for it, batch in tqdm(enumerate(train_dl), total=None):
+        if len(batch) >= 3 and torch.is_tensor(batch[1]):
+            # cache mode
+            if len(batch) == 4:
+                x, t_summary, t_spatial_tokens, keys = batch
+            else:
+                x, t_summary, t_spatial_tokens = batch
+                keys = None
+        else:
+            # online mode
+            x, pil_rs, keys = batch
+            assert teacher is not None and teacher_proc is not None, "Online train requires teacher + proc"
+            t_summary, t_spatial_tokens = teacher_forward_fixed(
+                teacher=teacher,
+                proc=teacher_proc,
+                pil_imgs=pil_rs,
+                device=device,
+                size=size,
+                amp=teacher_amp,
+            )
+            assert t_spatial_tokens.shape[1] == Ht * Wt, \
+                f"Teacher tokens T={t_spatial_tokens.shape[1]} != Ht*Wt={Ht * Wt}. Check resizing/proc."
         steps_per_epoch = 3800
 
         w.lambda_sp_mse = ramp_linear(step=step, warmup_steps=int(mse_sp_w_warmup_frac * steps_per_epoch),
@@ -471,11 +537,11 @@ def train_one_epoch(
             print("Evaluating..")
             best_val_loss = evaluate_step(Dt, Ht, Wt, amp, best_val_loss, checkpoint_dir, device, ep, eval_batches,
                                           grad_eps, model, w.lambda_sp_mse, patch_size, size, step, student_name, tb_writer,
-                                          val_dl, w)
+                                          val_dl, w, teacher=teacher, teacher_proc=teacher_proc, teacher_amp=teacher_amp)
 
     best_val_loss = evaluate_step(Dt, Ht, Wt, amp, best_val_loss, checkpoint_dir, device, ep, eval_batches,
                                   grad_eps, model, w.lambda_sp_mse, patch_size, size, step, student_name, tb_writer,
-                                  val_dl, w, force_save=True)
+                                  val_dl, w, teacher=teacher, teacher_proc=teacher_proc, teacher_amp=teacher_amp, force_save=True)
 
     return step, best_val_loss
 
@@ -483,7 +549,7 @@ def train_one_epoch(
 def evaluate_step(Dt: int, Ht: int, Wt: int, amp: bool, best_val_loss: float | None, checkpoint_dir: Path, device: str,
                   ep: int, eval_batches: int, grad_eps: float, model: DistillModel, mse_sp_w: float, patch_size: int,
                   size: int, step: int, student_name: str, tb_writer: SummaryWriter, val_dl: DataLoader,
-                  w: LossWeights, force_save: bool = False) -> float:
+                  w: LossWeights, teacher=None, teacher_proc=None, teacher_amp: bool = True, force_save: bool = False) -> float:
     metrics = evaluate(
         model=model,
         dl=val_dl,
@@ -496,7 +562,9 @@ def evaluate_step(Dt: int, Ht: int, Wt: int, amp: bool, best_val_loss: float | N
         step=step,
         w=w,
         max_batches=eval_batches,
-        grad_eps=grad_eps
+        grad_eps=grad_eps,
+        size=size,
+        teacher=teacher, teacher_proc=teacher_proc, teacher_amp=teacher_amp
     )
     print(
         f"[VAL] step={step} "

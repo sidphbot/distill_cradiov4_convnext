@@ -3,6 +3,8 @@ import io
 import os
 import random
 import tarfile
+from PIL import Image
+import hashlib
 from typing import List, Tuple
 
 import torch
@@ -16,6 +18,87 @@ from torchvision.transforms import InterpolationMode
 # ============================================================
 # DATA
 # ============================================================
+
+def _stable_hash01(s: str) -> float:
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()
+    x = int(h[:8], 16) / 0xFFFFFFFF
+    return float(x)
+
+def read_image_list(list_file: str) -> List[str]:
+    paths = []
+    with open(list_file, "r", encoding="utf-8") as f:
+        for ln in f:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            paths.append(s)
+    if not paths:
+        raise RuntimeError(f"No image paths found in {list_file}")
+    return paths
+
+def split_paths_deterministic(paths: List[str], val_frac: float, seed: int) -> Tuple[List[str], List[str]]:
+    # Deterministic per-path split; seed just offsets the hash slightly
+    train, val = [], []
+    for p in paths:
+        x = _stable_hash01(f"{seed}:{p}")
+        (val if x < val_frac else train).append(p)
+    if not train or not val:
+        raise RuntimeError(f"Split produced empty train/val (val_frac={val_frac}).")
+    return train, val
+
+class ImagePathDataset(torch.utils.data.Dataset):
+    def __init__(self, paths: List[str]):
+        self.paths = list(paths)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+        rng = random.Random(self.epoch)
+        rng.shuffle(self.paths)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx: int):
+        p = self.paths[idx]
+        return p
+
+
+def make_online_collate(size: int = 416, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    """
+    Returns:
+      x: (B,3,size,size) float32 normalized (student input)
+      pil_rs: List[PIL.Image] resized to (size,size) for teacher proc(do_resize=False)
+      keys: List[str] (we use the path as key; if you want basename-only, change here)
+    """
+    def _collate(batch):
+        xs = []
+        pil_rs = []
+        keys = []
+
+        for p in batch:
+            try:
+                with open(p, "rb") as f:
+                    b = f.read()
+                pil = Image.open(io.BytesIO(b)).convert("RGB")
+                pil = pil.resize((size, size), resample=Image.BICUBIC)  # EXACTLY like caching
+                # student tensor from resized PIL (no extra resize)
+                img_u8 = TF.pil_to_tensor(pil)  # (C,H,W) uint8
+                x = img_u8.float().div(255.0)
+                x = TF.normalize(x, mean=mean, std=std)
+                xs.append(x)
+                pil_rs.append(pil)
+                keys.append(p)
+            except Exception:
+                continue
+
+        if not xs:
+            # In case a whole batch fails decoding
+            raise RuntimeError("All samples in batch failed to load.")
+
+        return torch.stack(xs, dim=0), pil_rs, keys
+
+    return _collate
 
 def decode_image_bytes_fast(img_bytes: bytes) -> torch.Tensor:
     # returns uint8 tensor (C,H,W)
