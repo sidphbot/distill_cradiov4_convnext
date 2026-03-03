@@ -1,0 +1,432 @@
+"""PyTorch Lightning module for distillation training."""
+
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from torchvision.utils import make_grid
+
+from distill.augment import apply_student_augmentations
+from distill.model import (
+    DistillModel,
+    LossWeights,
+    compute_losses,
+    ramp_linear,
+    teacher_forward_fixed,
+    log_spatial_compare_first_sample,
+    _flatten_spatial_tokens,
+    _cosine_sim,
+    _batch_retrieval_top1,
+    _batch_retrieval_mrr,
+    _centered_kernel_alignment,
+    _style_gram_loss,
+    _spatial_energy,
+    _corrcoef_1d,
+    _pearson_corr_per_sample,
+    _sobel_mag_2d,
+    _laplacian_highpass_depthwise,
+    build_param_groups,
+)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _normalize_batch(x: torch.Tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD) -> torch.Tensor:
+    """Normalize (B,3,H,W) float [0,1] tensor with ImageNet stats. In-place friendly."""
+    m = torch.tensor(mean, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    s = torch.tensor(std, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    return x.sub_(m).div_(s)
+
+
+class DistillLightningModule(pl.LightningModule):
+    def __init__(
+        self,
+        cfg,
+        model: DistillModel,
+        teacher,
+        teacher_proc,
+        Ct: int,
+        Dt: int,
+        Ht: int,
+        Wt: int,
+    ):
+        super().__init__()
+        self.automatic_optimization = False  # manual opt to match old loop memory profile
+        self.cfg = cfg
+        self.model = model
+        # Store teacher WITHOUT registering as a submodule —
+        # prevents Lightning from calling .train() on it (must stay eval)
+        # and from including its params in state_dict / device management.
+        object.__setattr__(self, 'teacher', teacher)
+        object.__setattr__(self, 'teacher_proc', teacher_proc)
+        self.Ct = Ct
+        self.Dt = Dt
+        self.Ht = Ht
+        self.Wt = Wt
+
+        self.loss_w = LossWeights(
+            lambda_summary=cfg.lambda_summary,
+            lambda_spatial=cfg.lambda_spatial,
+            lambda_mse=cfg.lambda_mse,
+        )
+
+        self.best_val_loss = None
+
+        self.checkpoint_dir = Path(cfg.exp_root) / "checkpoints"
+
+        # Augmentation ramp params
+        self.aug_warmup_steps = 4000
+
+        # Manual grad accumulation & AMP
+        self._grad_accum = cfg.grad_accum
+        self._scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
+        self._micro_step = 0
+
+        # Eval accumulators
+        self._val_agg = {}
+        self._val_n = 0
+        self._val_summary_cos = []
+        self._val_spatial_cos = []
+        self._val_edge_corr = []
+        self._val_scalar_sums = {}
+
+        self._cached_opt = None
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        img_u8, pil_rs, keys = batch
+        device = self.device
+        if self._cached_opt is None:
+            self._cached_opt = self.optimizers()
+        opt = self._cached_opt
+
+        # 1. Teacher forward (no grad)
+        t_summary, t_spatial_tokens = teacher_forward_fixed(
+            teacher=self.teacher,
+            proc=self.teacher_proc,
+            pil_imgs=pil_rs,
+            device=str(device),
+            size=self.cfg.size,
+            amp=self.cfg.teacher_amp,
+        )
+        del pil_rs  # free PIL list
+        # Flush cached blocks from teacher's huge attention intermediates
+        # so student can allocate contiguous memory for forward+backward
+        torch.cuda.empty_cache()
+
+        # 2. Ramp loss weights
+        steps_per_epoch = 3800
+        self.loss_w.lambda_sp_mse = ramp_linear(
+            step=self.global_step,
+            warmup_steps=int(self.cfg.mse_sp_w_warmup_frac * steps_per_epoch),
+            start=self.cfg.mse_sp_w_start,
+            end=self.cfg.mse_sp_w_end,
+        )
+        self.loss_w.lambda_grad = ramp_linear(
+            step=self.global_step,
+            warmup_steps=int(self.cfg.grad_w_warmup_frac * steps_per_epoch),
+            start=self.cfg.grad_w_start,
+            end=self.cfg.grad_w_end,
+        )
+
+        # 3. Augment student input ON CPU, then move normalized result to GPU
+        aug_p = ramp_linear(self.global_step, self.aug_warmup_steps, 0.0, 0.6)
+
+        # Periodically log image grids (before we consume img_u8)
+        log_images = (self.global_step % (self.cfg.log_every * 5) == 0 and self.global_step > 0)
+
+        x_float = apply_student_augmentations(img_u8, aug_p)  # CPU: (B,3,H,W) float [0,1]
+
+        if log_images:
+            self._log_image_grids(img_u8, x_float, "train")
+
+        del img_u8  # free CPU uint8 batch
+
+        x = _normalize_batch(x_float)  # in-place on CPU float
+        x = x.to(device, non_blocking=True)  # single GPU copy
+
+        # 4. Forward + loss under autocast
+        t_summary = t_summary.to(device, non_blocking=True).float()
+        t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
+
+        with torch.amp.autocast("cuda", enabled=self.cfg.amp):
+            s_sum, s_tokens, s_sp, (f2, f3) = self.model(x)
+            out = compute_losses(
+                s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens,
+                self.loss_w, self.cfg.grad_eps, self.Ht, self.Wt,
+            )
+            loss = out["loss"] / self._grad_accum
+
+        # 5. Extract scalars BEFORE backward so we can free everything after
+        log_vals = {k: v.item() for k, v in out.items()}
+        log_vals["mse_sp_w"] = self.loss_w.lambda_sp_mse
+        log_vals["grad_w"] = self.loss_w.lambda_grad
+        log_vals["aug_p"] = aug_p
+
+        # 6. Scaled backward — frees graph immediately
+        self._scaler.scale(loss).backward()
+
+        # 7. Free all forward intermediates now that graph is released
+        del loss, out, s_sum, s_tokens, s_sp, f2, f3
+        del x, t_summary, t_spatial_tokens
+
+        self._micro_step += 1
+
+        # 8. Optimizer step every grad_accum micro-steps
+        if self._micro_step >= self._grad_accum:
+            self._scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self._scaler.step(opt)
+            self._scaler.update()
+            opt.zero_grad(set_to_none=True)
+            self._micro_step = 0
+
+        # 9. Logging — write directly to TB, bypass Lightning's metric accumulation
+        tb = self.logger.experiment
+        step = self.global_step
+        for k, v in log_vals.items():
+            tb.add_scalar(f"train/{k}", v, step)
+
+        # Memory tracking — print every 10 steps to spot leaks
+        if step % 10 == 0 and torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**2
+            resv = torch.cuda.memory_reserved() / 1024**2
+            print(f"[MEM] step={step} allocated={alloc:.0f}MB reserved={resv:.0f}MB")
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        img_u8, pil_rs, keys = batch
+        device = self.device
+
+        # Teacher forward
+        t_summary, t_spatial_tokens = teacher_forward_fixed(
+            teacher=self.teacher,
+            proc=self.teacher_proc,
+            pil_imgs=pil_rs,
+            device=str(device),
+            size=self.cfg.size,
+            amp=self.cfg.teacher_amp,
+        )
+        del pil_rs
+
+        # Student: no augmentations, normalize on CPU then move to GPU
+        x = img_u8.float().div_(255.0)
+        del img_u8
+        _normalize_batch(x)  # in-place
+        x = x.to(device, non_blocking=True)
+
+        t_summary = t_summary.to(device, non_blocking=True).float()
+        t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
+
+        with torch.amp.autocast("cuda", enabled=self.cfg.amp):
+            s_sum, s_tokens, s_sp, _ = self.model(x)
+            out = compute_losses(
+                s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens,
+                self.loss_w, self.cfg.grad_eps, self.Ht, self.Wt,
+            )
+
+        # Accumulate losses as floats
+        if not self._val_agg:
+            self._val_agg = {k: 0.0 for k in out}
+        for k in out:
+            self._val_agg[k] += out[k].item()
+        del out
+
+        # Spatial compare logs for first few batches (uses GPU tensors, do before moving to CPU)
+        if batch_idx % 3 == 0 and batch_idx < 15:
+            tb = self.logger.experiment
+            log_spatial_compare_first_sample(
+                tb_writer=tb,
+                step=self.global_step,
+                s_spatial_bdhw=s_sp,
+                t_tokens_btd=t_spatial_tokens,
+                Ht=self.Ht,
+                Wt=self.Wt,
+                tag_prefix=f"eval/spatial_compare_{batch_idx}_first",
+                max_side=512,
+            )
+
+        # Move everything to CPU for diagnostics, free GPU immediately
+        s_sum_c = s_sum.float().cpu()
+        t_summary_c = t_summary.float().cpu()
+        s_sp_c = s_sp.float().cpu()
+        t_spatial_c = t_spatial_tokens.float().cpu()
+        x_c = x.float().cpu()
+        del s_sum, t_summary, s_tokens, s_sp, t_spatial_tokens, x
+        torch.cuda.empty_cache()
+
+        self._val_n += 1
+
+        # All diagnostics on CPU
+        s_tokens2 = _flatten_spatial_tokens(s_sp_c)        # (B,T,D)
+        t_tokens2 = t_spatial_c                              # already (B,T,D)
+        B, Tt, Dt_ = t_tokens2.shape
+        t_map = t_tokens2.transpose(1, 2).contiguous().reshape(B, Dt_, self.Ht, self.Wt)
+
+        self._val_summary_cos.append(_cosine_sim(s_sum_c, t_summary_c, dim=-1))
+        self._val_spatial_cos.append(_cosine_sim(s_tokens2, t_tokens2, dim=-1).flatten())
+
+        sums = self._val_scalar_sums
+        sums["retrieval_top1"] = sums.get("retrieval_top1", 0.0) + float(_batch_retrieval_top1(s_sum_c, t_summary_c))
+        sums["retrieval_mrr"] = sums.get("retrieval_mrr", 0.0) + float(_batch_retrieval_mrr(s_sum_c, t_summary_c))
+        sums["summary_cka"] = sums.get("summary_cka", 0.0) + float(_centered_kernel_alignment(s_sum_c, t_summary_c))
+
+        sums["summary_mse_mean"] = sums.get("summary_mse_mean", 0.0) + float(((s_sum_c - t_summary_c) ** 2).mean())
+        sums["summary_norm_ratio"] = sums.get("summary_norm_ratio", 0.0) + float((s_sum_c.norm(dim=-1) / (t_summary_c.norm(dim=-1) + 1e-8)).mean())
+        sums["summary_mean_abs_diff"] = sums.get("summary_mean_abs_diff", 0.0) + float((s_sum_c.mean(dim=0) - t_summary_c.mean(dim=0)).abs().mean())
+        sums["summary_std_abs_diff"] = sums.get("summary_std_abs_diff", 0.0) + float((s_sum_c.std(dim=0) - t_summary_c.std(dim=0)).abs().mean())
+        del s_sum_c, t_summary_c
+
+        sums["spatial_mse_mean"] = sums.get("spatial_mse_mean", 0.0) + float(((s_tokens2 - t_tokens2) ** 2).mean())
+        sums["spatial_norm_ratio"] = sums.get("spatial_norm_ratio", 0.0) + float((s_tokens2.norm(dim=-1) / (t_tokens2.norm(dim=-1) + 1e-8)).mean())
+        sums["spatial_style_gram"] = sums.get("spatial_style_gram", 0.0) + float(_style_gram_loss(s_tokens2, t_tokens2))
+
+        s_energy = _spatial_energy(s_sp_c)
+        t_energy = _spatial_energy(t_map)
+        sums["spatial_energy_ratio"] = sums.get("spatial_energy_ratio", 0.0) + float((s_energy / (t_energy + 1e-8)).mean())
+
+        s_meanD = s_tokens2.mean(dim=1)
+        t_meanD = t_tokens2.mean(dim=1)
+        sums["spatial_meanD_corr"] = sums.get("spatial_meanD_corr", 0.0) + float(_corrcoef_1d(s_meanD.flatten(), t_meanD.flatten()))
+        del s_tokens2, t_tokens2, s_meanD, t_meanD
+
+        # Edge alignment (all CPU)
+        x_gray = x_c.mean(dim=1, keepdim=True)
+        g_img = _sobel_mag_2d(x_gray)
+        del x_c, x_gray
+        s_energy_map = torch.sqrt((s_sp_c * s_sp_c).sum(dim=1, keepdim=True) + 1e-8)
+        g_feat = _sobel_mag_2d(s_energy_map)
+        del s_energy_map
+        g_img_ds = F.interpolate(g_img, size=(self.Ht, self.Wt), mode="bilinear", align_corners=False)
+        del g_img
+        self._val_edge_corr.append(_pearson_corr_per_sample(g_feat.flatten(1), g_img_ds.flatten(1)))
+        del g_feat, g_img_ds
+
+        # HF metrics (all CPU)
+        s_hf = _laplacian_highpass_depthwise(s_sp_c)
+        t_hf = _laplacian_highpass_depthwise(t_map)
+        del s_sp_c, t_map, t_spatial_c
+        s_hf_tok = _flatten_spatial_tokens(s_hf)
+        t_hf_tok = _flatten_spatial_tokens(t_hf)
+        sums["hf_cos"] = sums.get("hf_cos", 0.0) + float(_cosine_sim(s_hf_tok, t_hf_tok, dim=-1).mean())
+        sums["hf_mse"] = sums.get("hf_mse", 0.0) + float(F.mse_loss(s_hf, t_hf))
+        s_hf_energy = _spatial_energy(s_hf)
+        t_hf_energy = _spatial_energy(t_hf)
+        sums["hf_energy_ratio"] = sums.get("hf_energy_ratio", 0.0) + float((s_hf_energy / (t_hf_energy + 1e-8)).mean())
+        del s_hf, t_hf, s_hf_tok, t_hf_tok
+
+    def on_validation_epoch_end(self):
+        # Just defragment GPU — reporting happens in on_train_epoch_end
+        torch.cuda.empty_cache()
+
+    def on_train_epoch_end(self):
+        n = self._val_n
+        if n == 0:
+            return
+
+        tb = self.logger.experiment
+        step = self.global_step
+
+        # Mean losses
+        val_loss = self._val_agg.get("loss", 0.0) / n
+        for k, v in self._val_agg.items():
+            tb.add_scalar(f"val/{k}", v / n, step)
+
+        # Quantile metrics
+        if self._val_summary_cos:
+            cat = torch.cat(self._val_summary_cos, dim=0)
+            tb.add_scalar("val/summary_cos_mean", cat.mean().item(), step)
+            tb.add_scalar("val/summary_cos_p05", torch.quantile(cat, 0.05).item(), step)
+            tb.add_scalar("val/summary_cos_p95", torch.quantile(cat, 0.95).item(), step)
+
+        if self._val_spatial_cos:
+            cat = torch.cat(self._val_spatial_cos, dim=0)
+            tb.add_scalar("val/spatial_cos_mean", cat.mean().item(), step)
+            tb.add_scalar("val/spatial_cos_p05", torch.quantile(cat, 0.05).item(), step)
+            tb.add_scalar("val/spatial_cos_p95", torch.quantile(cat, 0.95).item(), step)
+
+        if self._val_edge_corr:
+            cat = torch.cat(self._val_edge_corr, dim=0)
+            tb.add_scalar("val/edge_align_corr_mean", cat.mean().item(), step)
+            tb.add_scalar("val/edge_align_corr_p05", torch.quantile(cat, 0.05).item(), step)
+            tb.add_scalar("val/edge_align_corr_p95", torch.quantile(cat, 0.95).item(), step)
+
+        # Scalar means
+        for k, v in self._val_scalar_sums.items():
+            tb.add_scalar(f"val/{k}", v / n, step)
+
+        # Checkpointing on val improvement
+        if self.best_val_loss is None or val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self._save_checkpoint(step, val_loss)
+
+        # Print epoch summary
+        print(
+            f"[VAL] epoch={self.current_epoch} step={step} loss={val_loss:.4f} "
+            f"loss_sum={self._val_agg.get('loss_sum', 0) / n:.4f} "
+            f"loss_sp={self._val_agg.get('loss_sp', 0) / n:.4f} "
+            f"(aggregated over {n} val batches)"
+        )
+
+        # Reset accumulators for next epoch
+        self._val_agg = {}
+        self._val_n = 0
+        self._val_summary_cos = []
+        self._val_spatial_cos = []
+        self._val_edge_corr = []
+        self._val_scalar_sums = {}
+
+    def on_train_epoch_start(self):
+        # Update dataset seed for pad-vs-squash variation
+        dl = self.trainer.train_dataloader
+        if dl is not None and hasattr(dl, 'dataset'):
+            ds = dl.dataset
+            if hasattr(ds, 'set_epoch'):
+                ds.set_epoch(self.current_epoch)
+
+    def configure_optimizers(self):
+        params = []
+        params += build_param_groups(self.model.student, self.cfg.wd)
+        params += build_param_groups(self.model.sum_head, self.cfg.wd)
+        params += build_param_groups(self.model.sp_head, self.cfg.wd)
+        opt = torch.optim.AdamW(params, lr=self.cfg.lr, betas=(0.9, 0.999), eps=1e-8)
+        return opt
+
+    def _save_checkpoint(self, step: int, val_loss: float):
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        save_path = self.checkpoint_dir / f"epoch_{self.current_epoch}_step_{step}_val_loss_{val_loss:.3f}.pth"
+        torch.save(
+            {
+                "student_name": self.cfg.student_variant,
+                "size": self.cfg.size,
+                "patch_size": self.cfg.patch_size,
+                "teacher_summary_dim": self.model.sum_head.fc.out_features,
+                "teacher_spatial_dim": self.model.sp_head.conv.out_channels,
+                "student_state_dict": self.model.student.state_dict(),
+                "sum_head_state_dict": self.model.sum_head.state_dict(),
+                "sp_head_state_dict": self.model.sp_head.state_dict(),
+            },
+            save_path,
+        )
+        print(f"Saved checkpoint: {save_path}")
+
+    @torch.no_grad()
+    def _log_image_grids(self, img_u8: torch.Tensor, x_augmented: torch.Tensor, prefix: str):
+        """Log teacher (un-augmented) and student (augmented) input grids. Both on CPU."""
+        tb = self.logger.experiment
+        step = self.global_step
+        n = min(8, img_u8.shape[0])
+
+        # Teacher input: original uint8 -> [0,1]
+        teacher_imgs = img_u8[:n].float().div(255.0)
+        teacher_grid = make_grid(teacher_imgs, nrow=4, normalize=False)
+        tb.add_image(f"{prefix}/teacher_input", teacher_grid, step)
+
+        # Student input: augmented float [0,1]
+        student_imgs = x_augmented[:n].detach()
+        student_grid = make_grid(student_imgs, nrow=4, normalize=False)
+        tb.add_image(f"{prefix}/student_input", student_grid, step)

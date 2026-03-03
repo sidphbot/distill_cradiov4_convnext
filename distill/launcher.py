@@ -6,40 +6,34 @@ from typing import Tuple
 
 import timm
 import torch
-from torch.utils.data import IterableDataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
 
 from transformers import AutoModel, CLIPImageProcessor
-from distill.loop import teacher_forward_fixed  # we’ll add this in loop.py below
 
-from distill.data import (
-    find_shards, TarShardDataset, make_collate,
-    read_image_list, split_paths_deterministic, ImagePathDataset, make_online_collate
+from distill.data import DistillDataModule
+from distill.model import (
+    DistillModel, SummaryHead, SpatialHead,
+    build_param_groups, teacher_forward_fixed,
 )
-from distill.loop import LossWeights, train_one_epoch
-from distill.model import DistillModel, SummaryHead, SpatialHead, build_param_groups
+from distill.lightning_module import DistillLightningModule
 
 
 # ============================================================
-# MAIN WRAPPER
+# CONFIG
 # ============================================================
 
 @dataclass
 class TrainConfig:
-    cache_dir: str = ""
     student_variant: str = "small"  # tiny|small
     mode: str = "debug"  # debug|full
-    debug_train_shards: int = 2
-    debug_val_shards: int = 1
     size: int = 416
     patch_size: int = 16
 
-    # NEW
-    distill_mode: str = "cache"  # "cache" | "online"
-    data_list: str = ""          # path to txt file of image paths (online)
-    val_frac: float = 0.02       # deterministic split for online
+    data_list: str = ""          # path to txt file of image paths
+    val_frac: float = 0.02       # deterministic split
 
-    # teacher (online)
+    # teacher
     teacher_id: str = "nvidia/C-RADIOv4-H"
     teacher_amp: bool = True
 
@@ -76,6 +70,11 @@ class TrainConfig:
 
     grad_eps: float = 1e-3
 
+    # Data caps (0 = no cap)
+    train_cap: int = 0
+    val_cap: int = 0
+
+
 def pick_student_name(variant: str) -> str:
     if variant == "tiny":
         return "convnext_tiny.dinov3_lvd1689m"
@@ -84,137 +83,15 @@ def pick_student_name(variant: str) -> str:
     raise ValueError(f"Unknown student_variant={variant}")
 
 
-def infer_teacher_dims(train_ds: IterableDataset, size: int, patch_size: int) -> Tuple[int, int, int, int]:
-    first_payload = None
-    for _, payload, _ in train_ds:
-        first_payload = payload
-        break
-    if first_payload is None:
-        raise RuntimeError("Could not read any samples from cache.")
-
-    Ct = int(first_payload["summary"].shape[0])
-    Tt, Dt = first_payload["spatial_tokens"].shape
-    Ht = size // patch_size
-    Wt = size // patch_size
-    assert Tt == Ht * Wt, f"Teacher token count T={Tt} != {Ht}*{Wt} (check size/patch_size)"
-    return Ct, Dt, Ht, Wt
-
-def build_loaders_online(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, str]:
-    all_paths = read_image_list(cfg.data_list)
-    train_paths, val_paths = split_paths_deterministic(all_paths, val_frac=cfg.val_frac, seed=cfg.seed)
-
-    if cfg.mode == "debug":
-        train_paths = train_paths[: 5000]
-        val_paths = val_paths[: 1000]
-        # cfg.num_workers = 0
-        cfg.eval_every = 5
-        cfg.eval_batches = 5
-        # cfg.persistent_workers = False
-        # cfg.prefetch_factor = 2
-        cfg.exp_suffix = 'debug' if cfg.exp_suffix == '' else cfg.exp_suffix + '_debug'
-        print(f"[DEBUG][ONLINE] train={len(train_paths)} val={len(val_paths)}")
-    else:
-        print(f"[FULL][ONLINE] train={len(train_paths)} val={len(val_paths)}")
-
-    train_ds = ImagePathDataset(train_paths)
-    val_ds = ImagePathDataset(val_paths)
-
-    collate_fn = make_online_collate(size=cfg.size)
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-    )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-    )
-
-    student_name = pick_student_name(cfg.student_variant)
-    return train_dl, val_dl, student_name
-
-
-def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Tuple[int, int, int, int], str]:
-    train_shards, val_shards = find_shards(cfg.cache_dir)
-
-    num_workers = cfg.num_workers
-    eval_every = cfg.eval_every
-    eval_batches = cfg.eval_batches
-    persistent_workers = cfg.persistent_workers
-    prefetch_factor = cfg.prefetch_factor
-
-    if cfg.mode == "debug":
-        train_shards = train_shards[: cfg.debug_train_shards]
-        val_shards = val_shards[: cfg.debug_val_shards]
-        num_workers = 0
-        eval_every = 5
-        eval_batches = 5
-        persistent_workers = False
-        prefetch_factor = None
-        cfg.exp_suffix = 'debug' if cfg.exp_suffix == '' else cfg.exp_suffix + '_debug'
-        print(f"[DEBUG] Using train_shards={len(train_shards)} val_shards={len(val_shards)}")
-    else:
-        print(f"[FULL] Using train_shards={len(train_shards)} val_shards={len(val_shards)}")
-
-    train_ds = TarShardDataset(train_shards, shuffle_shards=True, seed=cfg.seed)
-    val_ds = TarShardDataset(val_shards, shuffle_shards=False, seed=cfg.seed)
-
-    # teacher dims
-    Ct, Dt, Ht, Wt = infer_teacher_dims(train_ds, cfg.size, cfg.patch_size)
-
-    collate_fn = make_collate(size=cfg.size)
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-    )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-    )
-
-    # return the *effective* debug overrides too
-    cfg.eval_every = eval_every
-    cfg.eval_batches = eval_batches
-    cfg.num_workers = num_workers
-    cfg.persistent_workers = persistent_workers
-    cfg.prefetch_factor = prefetch_factor if prefetch_factor is not None else 2
-
-    student_name = pick_student_name(cfg.student_variant)
-    return train_dl, val_dl, (Ct, Dt, Ht, Wt), student_name
-
-
-def build_model_and_optim(
-        cfg: TrainConfig,
-        device: str,
-        Ct: int,
-        Dt: int,
-        Ht: int,
-        Wt: int,
-        student_name: str,
-) -> Tuple[DistillModel, torch.optim.Optimizer, torch.amp.GradScaler]:
+def build_model(
+    cfg: TrainConfig,
+    device: str,
+    Ct: int,
+    Dt: int,
+    Ht: int,
+    Wt: int,
+    student_name: str,
+) -> DistillModel:
     student = timm.create_model(
         student_name,
         pretrained=True,
@@ -238,125 +115,7 @@ def build_model_and_optim(
     sp_head = SpatialHead(Cs_sp, Dt).to(device)
 
     model = DistillModel(student=student, sum_head=sum_head, sp_head=sp_head, Ht=Ht, Wt=Wt).to(device)
-
-    params = []
-    params += build_param_groups(model.student, cfg.wd)
-    params += build_param_groups(model.sum_head, cfg.wd)
-    params += build_param_groups(model.sp_head, cfg.wd)
-
-    opt = torch.optim.AdamW(params, lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8)
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
-    return model, opt, scaler
-
-
-class DistillRunner:
-    def __init__(self, cfg: TrainConfig):
-        self.cfg = cfg
-        torch.manual_seed(cfg.seed)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Device: {self.device}")
-
-        if cfg.distill_mode == "cache":
-            self.train_dl, self.val_dl, dims, self.student_name = build_loaders(cfg)
-            self.Ct, self.Dt, self.Ht, self.Wt = dims
-            self.teacher = None
-            self.teacher_proc = None
-        else:
-            # 1) build teacher/proc
-            self.teacher_proc = CLIPImageProcessor.from_pretrained(cfg.teacher_id)
-            self.teacher = AutoModel.from_pretrained(cfg.teacher_id, trust_remote_code=True).to(self.device).eval()
-            for p in self.teacher.parameters():
-                p.requires_grad_(False)
-
-            # 2) loaders from image list
-            self.train_dl, self.val_dl, self.student_name = build_loaders_online(cfg)
-
-            # 3) infer teacher dims by running teacher once on a batch
-            x0, pil_rs0, _ = next(iter(self.train_dl))
-            # (pil_rs0 are already resized to (size,size) in collate)
-            t_sum0, t_tok0 = teacher_forward_fixed(
-                teacher=self.teacher,
-                proc=self.teacher_proc,
-                pil_imgs=pil_rs0,
-                device=self.device,
-                size=cfg.size,
-                amp=cfg.teacher_amp,
-            )
-            self.Ct = int(t_sum0.shape[-1])
-            self.Dt = int(t_tok0.shape[-1])
-            self.Ht = cfg.size // cfg.patch_size
-            self.Wt = cfg.size // cfg.patch_size
-            Tt = int(t_tok0.shape[1])
-            assert Tt == self.Ht * self.Wt, f"T={Tt} != Ht*Wt={self.Ht * self.Wt} (check size/patch_size/teacher)"
-
-        self.model, self.opt, self.scaler = build_model_and_optim(
-            cfg=cfg,
-            device=self.device,
-            Ct=self.Ct,
-            Dt=self.Dt,
-            Ht=self.Ht,
-            Wt=self.Wt,
-            student_name=self.student_name,
-        )
-
-        self.loss_w = LossWeights(
-            lambda_summary=cfg.lambda_summary,
-            lambda_spatial=cfg.lambda_spatial,
-            lambda_mse=cfg.lambda_mse,
-        )
-
-        exp_dir = cfg.exp_root / f"exp_{time.strftime('%Y%m%d%H%M')}_{cfg.exp_suffix}"
-        self.tb_writer = SummaryWriter(log_dir=exp_dir / "tb")
-        self.checkpoint_dir = exp_dir / "checkpoints"
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    def run(self):
-        step = 0
-        best_val_loss = None
-
-        for ep in range(self.cfg.epochs):
-            ep_t0 = time.time()
-
-            self.train_dl.dataset.set_epoch(ep)
-
-            step, best_val_loss = train_one_epoch(
-                model=self.model,
-                train_dl=self.train_dl,
-                val_dl=self.val_dl,
-                device=self.device,
-                opt=self.opt,
-                scaler=self.scaler,
-                tb_writer=self.tb_writer,
-                step0=step,
-                ep=ep,
-                amp=self.cfg.amp,
-                grad_accum=self.cfg.grad_accum,
-                log_every=self.cfg.log_every,
-                eval_every=self.cfg.eval_every,
-                eval_batches=self.cfg.eval_batches,
-                Dt=self.Dt,
-                Ht=self.Ht,
-                Wt=self.Wt,
-                w=self.loss_w,
-                checkpoint_dir=self.checkpoint_dir,
-                student_name=self.student_name,
-                size=self.cfg.size,
-                patch_size=self.cfg.patch_size,
-                best_val_loss=best_val_loss,
-                mse_sp_w_start=self.cfg.mse_sp_w_start,
-                mse_sp_w_end=self.cfg.mse_sp_w_end,
-                mse_sp_w_warmup_frac=self.cfg.mse_sp_w_warmup_frac,
-                grad_w_start=self.cfg.grad_w_start,
-                grad_w_end=self.cfg.grad_w_end,
-                grad_w_warmup_frac=self.cfg.grad_w_warmup_frac,
-                grad_eps=self.cfg.grad_eps,
-                teacher=self.teacher,
-                teacher_proc=self.teacher_proc,
-                teacher_amp=self.cfg.teacher_amp
-            )
-
-            self.tb_writer.add_scalar("epoch", ep, step)
-            print(f"Epoch {ep} done in {(time.time() - ep_t0) / 60:.1f} min")
+    return model
 
 
 # ============================================================
@@ -365,13 +124,17 @@ class DistillRunner:
 
 def parse_args() -> TrainConfig:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache_dir", type=str, default="", help="Root cache dir containing train/ val/ test/")
     ap.add_argument("--student_variant", type=str, default="small", choices=["tiny", "small"])
     ap.add_argument("--mode", type=str, default="debug", choices=["debug", "full"])
-    ap.add_argument("--debug_train_shards", type=int, default=2)
-    ap.add_argument("--debug_val_shards", type=int, default=1)
     ap.add_argument("--size", type=int, default=416)
     ap.add_argument("--patch_size", type=int, default=16)
+
+    ap.add_argument("--data_list", type=str, default="", help="Text file with one image path per line.")
+    ap.add_argument("--image_dir", type=str, default="", help="Directory of images; auto-generates data_list in cwd.")
+    ap.add_argument("--val_frac", type=float, default=0.02)
+
+    ap.add_argument("--teacher_id", type=str, default="nvidia/C-RADIOv4-H")
+    ap.add_argument("--teacher_amp", action="store_true", default=True)
 
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--num_workers", type=int, default=8)
@@ -393,7 +156,7 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--eval_batches", type=int, default=50)
 
     ap.add_argument("--exp_root", type=Path, default=Path("/home/burplord/experiments/"))
-    ap.add_argument('--exp_suffix', type=str, default='')
+    ap.add_argument("--exp_suffix", type=str, default="")
     ap.add_argument("--seed", type=int, default=42)
 
     ap.add_argument("--lambda_summary", type=float, default=1.0)
@@ -403,36 +166,136 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--grad_checkpointing", action="store_true")
     ap.add_argument("--mse_sp_w_start", type=float, default=0.5)
     ap.add_argument("--mse_sp_w_end", type=float, default=1.5)
-    ap.add_argument("--mse_sp_w_warmup_frac", type=float, default=0.2)  # first 20% of training
+    ap.add_argument("--mse_sp_w_warmup_frac", type=float, default=0.2)
     ap.add_argument("--grad_w_start", type=float, default=0.1)
     ap.add_argument("--grad_w_end", type=float, default=1.3)
-    ap.add_argument("--grad_w_warmup_frac", type=float, default=0.35)  # first 20% of training
-
-    ap.add_argument("--grad_eps", type=float, default=1e-3)  # Charbonnier eps
-
-    ap.add_argument("--distill_mode", choices=["cache", "online"], default="cache")
-    ap.add_argument("--data_list", type=str, default="", help="Text file with one image path per line (online mode).")
-    ap.add_argument("--val_frac", type=float, default=0.02)
-
-    ap.add_argument("--teacher_id", type=str, default="nvidia/C-RADIOv4-H")
-    ap.add_argument("--teacher_amp", action="store_true", default=True)
+    ap.add_argument("--grad_w_warmup_frac", type=float, default=0.35)
+    ap.add_argument("--grad_eps", type=float, default=1e-3)
 
     a = ap.parse_args()
-    return TrainConfig(**vars(a))
+
+    assert not (a.data_list and a.image_dir), \
+        "Provide --data_list or --image_dir, not both."
+
+    if a.image_dir and not a.data_list:
+        a.data_list = _generate_data_list(a.image_dir)
+
+    # Debug mode overrides
+    if a.mode == "debug":
+        a.eval_every = 5
+        a.eval_batches = 5
+        a.train_cap = 5000
+        a.val_cap = 1000
+        a.exp_suffix = "debug" if not a.exp_suffix else a.exp_suffix + "_debug"
+
+    d = vars(a)
+    d.pop("image_dir", None)
+    return TrainConfig(**d)
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+
+
+def _generate_data_list(image_dir: str) -> str:
+    """Walk image_dir, write paths to ./data_list.txt, return its path."""
+    import os
+    root = os.path.abspath(image_dir)
+    paths = sorted(
+        os.path.join(dp, f)
+        for dp, _, fnames in os.walk(root)
+        for f in fnames
+        if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+    )
+    if not paths:
+        raise SystemExit(f"No images found in {root}")
+    out = os.path.join(os.getcwd(), "data_list.txt")
+    with open(out, "w") as fh:
+        fh.write("\n".join(paths) + "\n")
+    print(f"Generated {out} with {len(paths)} images from {root}")
+    return out
 
 
 def main():
     cfg = parse_args()
 
-    if cfg.distill_mode == "cache":
-        if not cfg.cache_dir:
-            raise SystemExit("--cache_dir is required for cache mode")
-    else:
-        if not cfg.data_list:
-            raise SystemExit("--data_list is required for online mode")
+    if not cfg.data_list:
+        raise SystemExit("--data_list or --image_dir is required")
 
-    runner = DistillRunner(cfg)
-    runner.run()
+    torch.manual_seed(cfg.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+
+    # 1. Build teacher
+    teacher_proc = CLIPImageProcessor.from_pretrained(cfg.teacher_id)
+    teacher = AutoModel.from_pretrained(cfg.teacher_id, trust_remote_code=True).to(device).eval().half()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    # 2. Build data module and setup to get a sample batch
+    dm = DistillDataModule(cfg)
+    dm.setup()
+
+    # 3. Infer teacher dims from one forward pass
+    sample_batch = next(iter(dm.train_dataloader()))
+    _, pil_rs0, _ = sample_batch
+    t_sum0, t_tok0 = teacher_forward_fixed(
+        teacher=teacher,
+        proc=teacher_proc,
+        pil_imgs=pil_rs0,
+        device=device,
+        size=cfg.size,
+        amp=cfg.teacher_amp,
+    )
+    Ct = int(t_sum0.shape[-1])
+    Dt = int(t_tok0.shape[-1])
+    Ht = cfg.size // cfg.patch_size
+    Wt = cfg.size // cfg.patch_size
+    Tt = int(t_tok0.shape[1])
+    assert Tt == Ht * Wt, f"T={Tt} != Ht*Wt={Ht * Wt}"
+    print(f"Teacher dims: Ct={Ct}, Dt={Dt}, Ht={Ht}, Wt={Wt}")
+    del t_sum0, t_tok0, pil_rs0, sample_batch
+    torch.cuda.empty_cache()
+
+    if device == "cuda":
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        resv = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU after teacher load: {alloc:.2f}GB allocated, {resv:.2f}GB reserved, {total:.2f}GB total")
+
+    # 4. Build student model
+    student_name = pick_student_name(cfg.student_variant)
+    model = build_model(cfg, device, Ct, Dt, Ht, Wt, student_name)
+
+    # 5. Create Lightning module
+    exp_name = f"exp_{time.strftime('%Y%m%d%H%M')}_{cfg.exp_suffix}" if cfg.exp_suffix else f"exp_{time.strftime('%Y%m%d%H%M')}"
+    lit_module = DistillLightningModule(
+        cfg=cfg,
+        model=model,
+        teacher=teacher,
+        teacher_proc=teacher_proc,
+        Ct=Ct, Dt=Dt, Ht=Ht, Wt=Wt,
+    )
+    lit_module.checkpoint_dir = cfg.exp_root / exp_name / "checkpoints"
+
+    # 6. Logger & Trainer
+    tb_logger = TensorBoardLogger(
+        save_dir=str(cfg.exp_root / exp_name),
+        name="tb",
+    )
+
+    # val_check_interval counts raw batches, but eval_every is in optimizer steps.
+    # Multiply by grad_accum to match the old loop's step-based eval schedule.
+    trainer = pl.Trainer(
+        max_epochs=cfg.epochs,
+        logger=tb_logger,
+        val_check_interval=cfg.eval_every * cfg.grad_accum,
+        limit_val_batches=cfg.eval_batches,
+        log_every_n_steps=cfg.log_every,
+        enable_progress_bar=True,
+    )
+
+    # 7. Train
+    trainer.fit(lit_module, datamodule=dm)
 
 
 if __name__ == "__main__":

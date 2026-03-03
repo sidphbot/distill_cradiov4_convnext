@@ -1,10 +1,11 @@
 import math
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import functional as F
+from PIL import Image
 
 
 # ============================================================
@@ -355,7 +356,6 @@ def make_sobel_kernels(device, dtype):
     ky = torch.tensor([[-1., -2., -1.],
                        [ 0.,  0.,  0.],
                        [ 1.,  2.,  1.]], device=device, dtype=dtype) / 8.0
-    # shape for conv2d with groups=C: (C,1,3,3) will be created later
     return kx, ky
 
 
@@ -387,3 +387,121 @@ def sobel_grad_loss(
     dx = charbonnier(sx - tx, eps=eps).mean()
     dy = charbonnier(sy - ty, eps=eps).mean()
     return dx + dy
+
+
+# ============================================================
+# Functions migrated from loop.py
+# ============================================================
+
+def tokens_to_map(x_tokens: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    # (B, HW, C) -> (B, C, H, W)
+    B, HW, C = x_tokens.shape
+    assert HW == H * W
+    return x_tokens.transpose(1, 2).contiguous().view(B, C, H, W)
+
+
+def ramp_linear(step: int, warmup_steps: int, start: float, end: float) -> float:
+    """Linear ramp from start->end over warmup_steps, then stays at end."""
+    if warmup_steps <= 0:
+        return end
+    t = min(max(step, 0), warmup_steps) / float(warmup_steps)
+    return start + t * (end - start)
+
+
+@dataclass
+class LossWeights:
+    lambda_summary: float = 1.0
+    lambda_spatial: float = 1.0
+    lambda_mse: float = 0.05
+    lambda_sp_mse: float = 0.5
+    lambda_grad: float = 0.05
+
+
+def compute_losses(
+        s_sum: torch.Tensor,
+        s_tokens: torch.Tensor,
+        s_sp: torch.Tensor,
+        t_summary: torch.Tensor,
+        t_tokens: torch.Tensor,
+        w: LossWeights,
+        grad_eps: float,
+        Ht: int,
+        Wt: int,
+) -> Dict[str, torch.Tensor]:
+    cos_sum = cosine_loss(s_sum, t_summary)
+    cos_sp = cosine_loss_spatial_tokens(s_tokens, t_tokens)
+
+    t_sp = tokens_to_map(t_tokens, Ht, Wt)
+
+    mse_sum = mse_loss(s_sum, t_summary)
+    mse_sp = mse_loss(s_sp, t_sp)
+
+    grad_loss = sobel_grad_loss(s_sp, t_sp, eps=grad_eps)
+
+    loss_sum = cos_sum + w.lambda_mse * mse_sum
+    loss_sp = cos_sp + w.lambda_sp_mse * mse_sp + w.lambda_grad * grad_loss
+    loss = w.lambda_summary * loss_sum + w.lambda_spatial * loss_sp
+
+    return {
+        "loss": loss,
+        "loss_sum": loss_sum,
+        "loss_sp": loss_sp,
+        "loss_grad": grad_loss,
+        "cos_sum": cos_sum,
+        "cos_sp": cos_sp,
+        "mse_sum": mse_sum,
+        "mse_sp": mse_sp,
+    }
+
+
+@torch.no_grad()
+def teacher_forward_fixed(teacher, proc, pil_imgs: list[Image.Image], device: str, size: int = 416, amp: bool = True):
+    pil_rs = [im.resize((size, size), resample=Image.BICUBIC) for im in pil_imgs]
+
+    pv = proc(
+        images=pil_rs,
+        return_tensors="pt",
+        do_resize=False,
+        do_center_crop=False,
+    ).pixel_values.to(device)
+
+    if amp and device.startswith("cuda"):
+        with torch.amp.autocast("cuda", enabled=True):
+            summary, spatial = teacher(pv)
+    else:
+        summary, spatial = teacher(pv)
+
+    return summary, spatial
+
+
+def _pearson_corr_per_sample(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    a = a - a.mean(dim=1, keepdim=True)
+    b = b - b.mean(dim=1, keepdim=True)
+    num = (a * b).sum(dim=1)
+    den = (a.norm(dim=1) * b.norm(dim=1) + eps)
+    return num / den
+
+
+def _sobel_mag_2d(x_b1hw: torch.Tensor) -> torch.Tensor:
+    device, dtype = x_b1hw.device, x_b1hw.dtype
+    kx = torch.tensor([[-1., 0., 1.],
+                       [-2., 0., 2.],
+                       [-1., 0., 1.]], device=device, dtype=dtype) / 8.0
+    ky = torch.tensor([[-1., -2., -1.],
+                       [ 0.,  0.,  0.],
+                       [ 1.,  2.,  1.]], device=device, dtype=dtype) / 8.0
+    kx = kx.view(1, 1, 3, 3)
+    ky = ky.view(1, 1, 3, 3)
+    gx = F.conv2d(x_b1hw, kx, padding=1)
+    gy = F.conv2d(x_b1hw, ky, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-8)
+
+
+def _laplacian_highpass_depthwise(x_bchw: torch.Tensor) -> torch.Tensor:
+    B, C, H, W = x_bchw.shape
+    device, dtype = x_bchw.device, x_bchw.dtype
+    k = torch.tensor([[0., 1., 0.],
+                      [1., -4., 1.],
+                      [0., 1., 0.]], device=device, dtype=dtype) / 4.0
+    k = k.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+    return F.conv2d(x_bchw, k, padding=1, groups=C)

@@ -7,5 +7,6 @@ dist/
 .idea/
 lightning_logs/
 *.log
+*.txt
 # (optional) If you use pip editable installs, also ignore:
 pip-wheel-metadata/

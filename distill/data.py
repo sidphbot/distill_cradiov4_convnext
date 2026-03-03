@@ -1,18 +1,14 @@
-import glob
-import io
-import os
-import random
-import tarfile
-from PIL import Image
 import hashlib
+import io
+import random
 from typing import List, Tuple
 
 import torch
-import torchvision
 import torchvision.transforms.functional as TF
-from torch.utils.data import IterableDataset
-from torchvision.io import decode_jpeg
-from torchvision.transforms import InterpolationMode
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+
+import pytorch_lightning as pl
 
 
 # ============================================================
@@ -23,6 +19,11 @@ def _stable_hash01(s: str) -> float:
     h = hashlib.md5(s.encode("utf-8")).hexdigest()
     x = int(h[:8], 16) / 0xFFFFFFFF
     return float(x)
+
+
+def _stable_hash_int(s: str) -> int:
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+
 
 def read_image_list(list_file: str) -> List[str]:
     paths = []
@@ -36,8 +37,8 @@ def read_image_list(list_file: str) -> List[str]:
         raise RuntimeError(f"No image paths found in {list_file}")
     return paths
 
+
 def split_paths_deterministic(paths: List[str], val_frac: float, seed: int) -> Tuple[List[str], List[str]]:
-    # Deterministic per-path split; seed just offsets the hash slightly
     train, val = [], []
     for p in paths:
         x = _stable_hash01(f"{seed}:{p}")
@@ -46,158 +47,132 @@ def split_paths_deterministic(paths: List[str], val_frac: float, seed: int) -> T
         raise RuntimeError(f"Split produced empty train/val (val_frac={val_frac}).")
     return train, val
 
-class ImagePathDataset(torch.utils.data.Dataset):
+
+class ImagePathDataset(Dataset):
     def __init__(self, paths: List[str]):
         self.paths = list(paths)
-        self.epoch = 0
+        self.seed = 0
 
     def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
-        rng = random.Random(self.epoch)
+        self.seed = int(epoch)
+        rng = random.Random(self.seed)
         rng.shuffle(self.paths)
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx: int):
-        p = self.paths[idx]
-        return p
+        return self.paths[idx]
 
 
-def make_online_collate(size: int = 416, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+def _pad_resize(pil: Image.Image, size: int) -> Image.Image:
+    """Resize preserving aspect ratio, pad shorter side with black to (size, size)."""
+    w, h = pil.size
+    scale = size / max(w, h)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    pil = pil.resize((new_w, new_h), resample=Image.BICUBIC)
+    canvas = Image.new("RGB", (size, size), (0, 0, 0))
+    paste_x = (size - new_w) // 2
+    paste_y = (size - new_h) // 2
+    canvas.paste(pil, (paste_x, paste_y))
+    return canvas
+
+
+class OnlineCollate:
     """
+    Callable collate that reads the dataset's seed to deterministically
+    choose pad-or-squash per image (50/50 based on stable hash).
+
     Returns:
-      x: (B,3,size,size) float32 normalized (student input)
-      pil_rs: List[PIL.Image] resized to (size,size) for teacher proc(do_resize=False)
-      keys: List[str] (we use the path as key; if you want basename-only, change here)
+        img_u8: (B, 3, H, W) uint8 tensor (NOT normalized)
+        pil_rs: List[PIL.Image] resized to (size, size) — for teacher
+        keys:   List[str] image paths
     """
-    def _collate(batch):
+
+    def __init__(self, dataset: ImagePathDataset, size: int = 416):
+        self.dataset = dataset
+        self.size = size
+
+    def __call__(self, batch):
         xs = []
         pil_rs = []
         keys = []
+        seed = self.dataset.seed
 
         for p in batch:
             try:
                 with open(p, "rb") as f:
                     b = f.read()
                 pil = Image.open(io.BytesIO(b)).convert("RGB")
-                pil = pil.resize((size, size), resample=Image.BICUBIC)  # EXACTLY like caching
-                # student tensor from resized PIL (no extra resize)
-                img_u8 = TF.pil_to_tensor(pil)  # (C,H,W) uint8
-                x = img_u8.float().div(255.0)
-                x = TF.normalize(x, mean=mean, std=std)
-                xs.append(x)
+
+                # Deterministic pad-or-squash decision per (seed, path)
+                h = _stable_hash_int(f"{seed}:{p}")
+                use_pad = (h % 2) == 0
+
+                if use_pad:
+                    pil = _pad_resize(pil, self.size)
+                else:
+                    pil = pil.resize((self.size, self.size), resample=Image.BICUBIC)
+
+                img_u8 = TF.pil_to_tensor(pil)  # (C, H, W) uint8
+                xs.append(img_u8)
                 pil_rs.append(pil)
                 keys.append(p)
             except Exception:
                 continue
 
         if not xs:
-            # In case a whole batch fails decoding
             raise RuntimeError("All samples in batch failed to load.")
 
         return torch.stack(xs, dim=0), pil_rs, keys
 
-    return _collate
 
-def decode_image_bytes_fast(img_bytes: bytes) -> torch.Tensor:
-    # returns uint8 tensor (C,H,W)
-    buf = torch.frombuffer(img_bytes, dtype=torch.uint8)
-    img = decode_jpeg(buf, device="cpu", mode=torchvision.io.ImageReadMode.RGB)  # (C,H,W) uint8
-    return img
-
-
-def preprocess_uint8(
-        img_u8: torch.Tensor,
-        size: int = 416,
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-) -> torch.Tensor:
-    # img_u8: (C,H,W) uint8
-    x = img_u8.float().div(255.0)
-    x = TF.resize(x, [size, size], interpolation=InterpolationMode.BICUBIC, antialias=True)
-    x = TF.normalize(x, mean=mean, std=std)
-    return x
-
-
-class TarShardDataset(IterableDataset):
-    """
-    Streams samples from a list of .tar shards.
-    Each sample has:
-      {key}.img  (raw image bytes)
-      {key}.pt   (torch payload dict with summary + spatial_tokens)
-    """
-
-    def __init__(self, shard_paths: List[str], shuffle_shards: bool = True, seed: int = 0):
+class DistillDataModule(pl.LightningDataModule):
+    def __init__(self, cfg):
         super().__init__()
-        self.shard_paths = list(shard_paths)
-        self.shuffle_shards = shuffle_shards
-        self.seed = seed
-        self.epoch = 0
+        self.cfg = cfg
+        self.train_ds = None
+        self.val_ds = None
 
-    def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
+    def setup(self, stage=None):
+        all_paths = read_image_list(self.cfg.data_list)
+        train_paths, val_paths = split_paths_deterministic(
+            all_paths, val_frac=self.cfg.val_frac, seed=self.cfg.seed,
+        )
 
-    def _iter_tar(self, tar_path: str):
-        with tarfile.open(tar_path, "r") as tf:
-            members = tf.getmembers()
-            imgs = {m.name[:-4] for m in members if m.name.endswith(".img")}
-            pts = {m.name[:-3] for m in members if m.name.endswith(".pt")}
-            keys = sorted(list(imgs.intersection(pts)))
+        if getattr(self.cfg, "train_cap", 0) > 0:
+            train_paths = train_paths[:self.cfg.train_cap]
+        if getattr(self.cfg, "val_cap", 0) > 0:
+            val_paths = val_paths[:self.cfg.val_cap]
 
-            for k in keys:
-                try:
-                    img_m = tf.getmember(k + ".img")
-                    pt_m = tf.getmember(k + ".pt")
+        print(f"[{self.cfg.mode.upper()}][ONLINE] train={len(train_paths)} val={len(val_paths)}")
 
-                    img_f = tf.extractfile(img_m)
-                    pt_f = tf.extractfile(pt_m)
-                    if img_f is None or pt_f is None:
-                        continue
+        self.train_ds = ImagePathDataset(train_paths)
+        self.val_ds = ImagePathDataset(val_paths)
 
-                    img_bytes = img_f.read()
+    def train_dataloader(self):
+        collate = OnlineCollate(self.train_ds, size=self.cfg.size)
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            collate_fn=collate,
+            persistent_workers=self.cfg.persistent_workers and self.cfg.num_workers > 0,
+            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
+        )
 
-                    # IMPORTANT: buffer the .pt into BytesIO before torch.load
-                    pt_bytes = pt_f.read()
-                    payload = torch.load(io.BytesIO(pt_bytes), map_location="cpu", weights_only=False)
-
-                    yield img_bytes, payload, k
-                except Exception:
-                    continue
-
-    def __iter__(self):
-        worker = torch.utils.data.get_worker_info()
-        shard_paths = self.shard_paths
-
-        if self.shuffle_shards:
-            wid = worker.id if worker else 0
-            rng = random.Random(self.seed + 1000 * self.epoch + wid)
-            rng.shuffle(shard_paths)
-
-        if worker is not None:
-            shard_paths = shard_paths[worker.id:: worker.num_workers]
-
-        for sp in shard_paths:
-            yield from self._iter_tar(sp)
-
-
-def make_collate(size: int = 416):
-    def _collate(batch):
-        xs, t_summ, t_spat, keys = [], [], [], []
-        for img_bytes, payload, key in batch:
-            img_u8 = decode_image_bytes_fast(img_bytes)
-            xs.append(preprocess_uint8(img_u8, size=size))
-            t_summ.append(payload["summary"])
-            t_spat.append(payload["spatial_tokens"])
-            keys.append(key)
-        return torch.stack(xs), torch.stack(t_summ), torch.stack(t_spat), keys
-
-    return _collate
-
-
-def find_shards(cache_dir: str) -> Tuple[List[str], List[str]]:
-    train_shards = sorted(glob.glob(os.path.join(cache_dir, "train", "*.tar")))
-    val_shards = sorted(glob.glob(os.path.join(cache_dir, "val", "*.tar")))
-    if not train_shards or not val_shards:
-        raise RuntimeError("No shards found. Expected train/*.tar and val/*.tar under cache_dir")
-    return train_shards, val_shards
+    def val_dataloader(self):
+        collate = OnlineCollate(self.val_ds, size=self.cfg.size)
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            collate_fn=collate,
+            persistent_workers=self.cfg.persistent_workers and self.cfg.num_workers > 0,
+            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
+        )
