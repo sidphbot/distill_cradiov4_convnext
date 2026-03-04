@@ -128,6 +128,27 @@ def _style_gram_loss(s_btd: torch.Tensor, t_btd: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(_gram_matrix(s_btd), _gram_matrix(t_btd))
 
 
+def _topk_activation_f1(s_tokens: torch.Tensor, t_tokens: torch.Tensor,
+                        k_values=(0.05, 0.10, 0.20),
+                        k_weights=(0.5, 0.3, 0.2), eps=1e-8) -> torch.Tensor:
+    """Weighted multi-k top-K activation F1. Inputs: (B,T,D) tokens."""
+    a_s = s_tokens.norm(dim=-1)  # (B, T)
+    a_t = t_tokens.norm(dim=-1)
+    B, T = a_s.shape
+    f1_per_k = []
+    for k_frac in k_values:
+        k_px = max(1, int(k_frac * T))
+        thresh_s = a_s.kthvalue(T - k_px + 1, dim=1).values.unsqueeze(1)
+        thresh_t = a_t.kthvalue(T - k_px + 1, dim=1).values.unsqueeze(1)
+        m_s = (a_s >= thresh_s).float()
+        m_t = (a_t >= thresh_t).float()
+        tp = (m_s * m_t).sum(dim=1)
+        fp = (m_s * (1 - m_t)).sum(dim=1)
+        fn = ((1 - m_s) * m_t).sum(dim=1)
+        f1_per_k.append(((2 * tp) / (2 * tp + fp + fn + eps)).mean())
+    return sum(w * f for w, f in zip(k_weights, f1_per_k))
+
+
 def _centered_kernel_alignment(z_s: torch.Tensor, z_t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     X = z_s - z_s.mean(dim=0, keepdim=True)
     Y = z_t - z_t.mean(dim=0, keepdim=True)

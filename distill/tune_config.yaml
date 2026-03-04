@@ -1,0 +1,80 @@
+# Optuna hyperparameter tuning configuration
+# Usage: python -m distill.tune --config distill/config.yaml --tune-config distill/tune_config.yaml [dotlist overrides for base config]
+
+study:
+  name: distill_sweep
+  storage: "sqlite:///optuna_distill.db"
+  n_trials: 400
+  n_startup: 30          # random trials before TPE
+  pruner_warmup_steps: 1
+  pruner_startup_trials: 20
+  seed: 42
+
+# Overrides applied to base config for every trial (fast eval settings)
+trial_overrides:
+  model:
+    student_variant: tiny
+  data:
+    train_cap: 15000
+    val_cap: 2000
+  dataloader:
+    batch_size: 128          # saturate A100/A6000 — reduce if OOM
+  training:
+    epochs: 3
+    grad_accum: 2
+  logging:
+    eval_every: 100
+    eval_batches: 20
+
+# Search space: each entry maps to a config dotpath
+# Types: log_float, float, int, categorical
+search_space:
+  training.lr:
+    type: log_float
+    low: 3.0e-5
+    high: 8.0e-4
+
+  training.wd:
+    type: log_float
+    low: 0.01
+    high: 0.2
+
+  loss.lambda_summary:
+    type: float
+    low: 0.5
+    high: 2.0
+
+  loss.lambda_spatial:
+    type: float
+    low: 0.5
+    high: 2.0
+
+  loss.lambda_mse:
+    type: float
+    low: 0.05
+    high: 0.5
+
+  loss.ramp.mse_sp.end:
+    type: float
+    low: 0.5
+    high: 3.0
+
+  loss.ramp.grad.end:
+    type: float
+    low: 0.3
+    high: 2.5
+
+  loss.ramp.cons_summary.end:
+    type: float
+    low: 0.1
+    high: 1.5
+
+  loss.ramp.cons_spatial.end:
+    type: float
+    low: 0.1
+    high: 1.5
+
+  augmentation.strength_end:
+    type: float
+    low: 0.3
+    high: 1.0

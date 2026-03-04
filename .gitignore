@@ -8,5 +8,6 @@ dist/
 lightning_logs/
 *.log
 *.txt
+*.db
 # (optional) If you use pip editable installs, also ignore:
 pip-wheel-metadata/

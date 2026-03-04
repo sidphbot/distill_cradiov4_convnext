@@ -26,6 +26,7 @@ from distill.model import (
     _style_gram_loss,
     _spatial_energy,
     _corrcoef_1d,
+    _topk_activation_f1,
     _pearson_corr_per_sample,
     _sobel_mag_2d,
     _laplacian_highpass_depthwise,
@@ -92,6 +93,7 @@ class DistillLightningModule(pl.LightningModule):
         self._val_spatial_cos = []
         self._val_edge_corr = []
         self._val_scalar_sums = {}
+        self._last_alignment_score = 0.0
 
         self._steps_per_epoch = steps_per_epoch
         self._cached_opt = None
@@ -347,6 +349,7 @@ class DistillLightningModule(pl.LightningModule):
         s_meanD = s_tokens2.mean(dim=1)
         t_meanD = t_tokens2.mean(dim=1)
         sums["spatial_meanD_corr"] = sums.get("spatial_meanD_corr", 0.0) + float(_corrcoef_1d(s_meanD.flatten(), t_meanD.flatten()))
+        sums["act_f1"] = sums.get("act_f1", 0.0) + float(_topk_activation_f1(s_tokens2, t_tokens2))
         del s_tokens2, t_tokens2, s_meanD, t_meanD
 
         # Edge alignment (all CPU)
@@ -414,6 +417,23 @@ class DistillLightningModule(pl.LightningModule):
         # Scalar means
         for k, v in self._val_scalar_sums.items():
             tb.add_scalar(f"val/{k}", v / n, step)
+
+        # Composite alignment score (all terms: higher = better)
+        # cos_sum/cos_sp are losses (1 - cos_sim), so invert them
+        cos_sum_sim = 1.0 - self._val_agg.get("cos_sum", 0.0) / n
+        cos_sp_sim  = 1.0 - self._val_agg.get("cos_sp", 0.0) / n
+        hf_cos_mean = self._val_scalar_sums.get("hf_cos", 0.0) / n
+        hf_mse_mean = self._val_scalar_sums.get("hf_mse", 0.0) / n
+        act_f1_mean = self._val_scalar_sums.get("act_f1", 0.0) / n
+
+        alignment_score = (
+            0.30 * cos_sum_sim + 0.30 * cos_sp_sim
+            + 0.20 * hf_cos_mean - 0.10 * hf_mse_mean
+            + 0.30 * act_f1_mean
+        )
+        tb.add_scalar("val/act_f1", act_f1_mean, step)
+        tb.add_scalar("val/alignment_score", alignment_score, step)
+        self._last_alignment_score = alignment_score
 
         # Checkpointing on val improvement
         if self.best_val_loss is None or val_loss < self.best_val_loss:

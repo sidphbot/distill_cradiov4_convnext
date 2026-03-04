@@ -140,6 +140,8 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 - **Losses**: `val/loss`, `val/loss_sum`, `val/loss_sp`, `val/cos_sum`, `val/cos_sp`, `val/mse_sum`, `val/mse_sp`, `val/grad`
 - **Summary diagnostics**: `val/summary_cos_{mean,pXX}`, `val/retrieval_top1`, `val/retrieval_mrr`, `val/summary_linear_cka`, `val/summary_mse_mean`, `val/summary_norm_ratio`, `val/summary_{mean,std}_abs_diff`
 - **Spatial diagnostics**: `val/spatial_cos_{mean,pXX}`, `val/spatial_mse_mean`, `val/spatial_norm_ratio`, `val/spatial_style_gram_mse`, `val/spatial_energy_ratio`, `val/spatial_meanD_corr`
+- **Activation F1**: `val/act_f1` — weighted multi-k top-K activation F1 measuring spatial activation overlap between student and teacher tokens (k=5%/10%/20%, weights 0.5/0.3/0.2)
+- **Alignment score**: `val/alignment_score` — composite metric: `0.30*cos_sum + 0.30*cos_sp + 0.20*hf_cos - 0.10*hf_mse + 0.30*act_f1`. Used as the objective for Optuna HP tuning.
 - **Edge/HF diagnostics**: `val/edge_align_corr_{mean,pXX}`, `val/hf_cos_mean`, `val/hf_mse_mean`, `val/hf_energy_ratio`
 - **Spatial compare images** (batches matching `logging.val_spatial_compare.batch_mod/max_batches`): cosine map, L2 map, side-by-side channel grid (max resolution `logging.val_spatial_compare.max_side`)
 - Quantile suffixes (pXX) are derived from `logging.quantiles` list (e.g. `[0.05, 0.95]` → p05, p95)
@@ -157,6 +159,37 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 ## Debug Mode
 
 When `mode=debug`: the `debug:` overlay from config.yaml is merged (by default: `data.train_cap=5000`, `data.val_cap=1000`, `logging.eval_every=5`, `logging.eval_batches=5`), and `_debug` is appended to the experiment suffix. All debug overrides are configurable in the YAML rather than hardcoded.
+
+## Hyperparameter Tuning (Optuna)
+
+```bash
+# Run HP sweep (settings from tune_config.yaml, base config from config.yaml)
+python -m distill.tune --config distill/config.yaml --tune-config distill/tune_config.yaml
+
+# With dotlist overrides for base config (same as launcher)
+python -m distill.tune --config distill/config.yaml --tune-config distill/tune_config.yaml \
+    data.data_list=/path/to/list.txt model.student_variant=tiny
+
+# Resume an interrupted sweep (same study name + SQLite DB — automatic via load_if_exists)
+python -m distill.tune --config distill/config.yaml --tune-config distill/tune_config.yaml
+```
+
+All tuning settings live in `distill/tune_config.yaml`:
+
+| Section | Controls |
+|---|---|
+| `study` | Study name, storage URL, n_trials, n_startup, pruner params, seed |
+| `trial_overrides` | Config overrides applied to every trial (data caps, epochs, eval frequency) |
+| `search_space` | Map of config dotpaths → `{type, low, high}` or `{type, choices}`. Types: `float`, `log_float`, `int`, `categorical` |
+
+To modify the search space, edit/extend `search_space` in `tune_config.yaml`. Each key is a dotpath into the base config (e.g. `training.lr`, `loss.ramp.mse_sp.end`).
+
+- **Sampler**: TPE with configurable random startup trials
+- **Pruner**: MedianPruner (kills below-median trials after warmup epochs)
+- **Storage**: SQLite for persistence/resumability
+- **Monitor**: `optuna-dashboard sqlite:///optuna_distill.db`
+
+Best trial params are printed at the end with a ready-to-run CLI command for full training.
 
 ## Memory Management
 
