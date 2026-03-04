@@ -4,10 +4,10 @@
 study:
   name: distill_sweep
   storage: "sqlite:///optuna_distill.db"
-  n_trials: 400
-  n_startup: 30          # random trials before TPE
-  pruner_warmup_steps: 1
-  pruner_startup_trials: 20
+  n_trials: 150
+  n_startup: 25          # random trials before TPE
+  pruner_warmup_steps: 2 # let 2 epochs pass before pruning
+  pruner_startup_trials: 15
   seed: 42
 
 # Overrides applied to base config for every trial (fast eval settings)
@@ -15,12 +15,12 @@ trial_overrides:
   model:
     student_variant: tiny
   data:
-    train_cap: 15000
-    val_cap: 2000
+    train_cap: 40000
+    val_cap: 3000
   dataloader:
     batch_size: 128          # saturate A100/A6000 — reduce if OOM
   training:
-    epochs: 3
+    epochs: 8               # enough for ramps to settle + loss balance to stabilize
     grad_accum: 2
   logging:
     eval_every: 100
