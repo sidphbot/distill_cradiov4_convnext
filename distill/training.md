@@ -1,17 +1,53 @@
 # Distillation Training Workflow
 
+## Quick Start
+
+```bash
+# Full training (defaults from config.yaml)
+python -m distill.launcher --config distill/config.yaml data.data_list=/path/to/list.txt
+
+# From an image directory (auto-generates data_list.txt)
+python -m distill.launcher --config distill/config.yaml data.image_dir=/path/to/images/
+
+# Debug mode (applies debug overlay: reduced data caps + frequent eval)
+python -m distill.launcher --config distill/config.yaml data.data_list=/path/to/list.txt mode=debug
+
+# CLI overrides (any dotpath into config.yaml)
+python -m distill.launcher --config distill/config.yaml data.data_list=/path/to/list.txt \
+    dataloader.batch_size=16 training.lr=3e-4 training.epochs=10
+```
+
+All parameters live in `distill/config.yaml`. CLI arguments are OmegaConf dotlist overrides merged on top. When `mode=debug`, the `debug:` section in the YAML is merged as an overlay (caps data, increases eval frequency) and `_debug` is appended to the experiment suffix.
+
 ## Architecture
 
-- **Teacher**: C-RADIOv4-H (ViT-Huge), frozen, fp16. Produces summary embedding `(B, Ct)` and spatial tokens `(B, T, Dt)`.
-- **Student**: ConvNeXt-small (or tiny), `features_only` with stages 2+3. Stage 3 pooled → `SummaryHead → (B, Ct)`. Stage 2 → `SpatialHead → (B, Dt, Ht, Wt)`.
-- Both operate at 416×416 input, patch_size=16 → Ht=Wt=26, T=676.
+- **Teacher**: C-RADIOv4-H (ViT-Huge), frozen, fp16. Produces summary embedding `(B, Ct)` and spatial tokens `(B, T, Dt)`. Model ID set by `teacher.id`.
+- **Student**: ConvNeXt variant selected by `model.student_variant` (mapped to a timm model name via `model.student_models`), `features_only` with stages 2+3. Stage 3 pooled → `SummaryHead → (B, Ct)`. Stage 2 → `SpatialHead → (B, Dt, Ht, Wt)`.
+- Both operate at `data.size` × `data.size` input, `data.patch_size` determines spatial grid: `Ht = Wt = size / patch_size`, `T = Ht * Wt`.
+
+## Configuration
+
+All training parameters are in `distill/config.yaml`. Key sections:
+
+| Section | Controls |
+|---|---|
+| `model` | Student variant, model names, spatial norm cap, grad checkpointing |
+| `teacher` | Teacher model ID, teacher AMP |
+| `data` | Data list path, image dir, val fraction, input size, patch size, data caps, normalization stats |
+| `dataloader` | Batch size, num workers, persistent workers, prefetch factor |
+| `training` | Epochs, LR, weight decay, AMP, grad accumulation, grad clip, optimizer betas/eps |
+| `loss` | Lambda weights, grad eps, ramp schedules (start/end/warmup_frac), steps per epoch |
+| `augmentation` | Warmup steps, probability ramp (p_start → p_end), albumentations pipeline definition |
+| `logging` | Log frequency, eval frequency/batches, image grid settings, spatial compare settings, mem tracking interval, quantile list |
+| `experiment` | Output root directory, experiment suffix |
+| `debug` | Overlay merged when `mode=debug` (overrides data caps and logging frequency) |
 
 ## Data Pipeline
 
 1. `ImagePathDataset` returns raw file paths; `OnlineCollate` loads + resizes at batch time.
-2. **Resize**: 50/50 deterministic (hash of `seed:path`) choice between aspect-ratio-preserving pad (black canvas) and squash to 416×416. Seed changes each epoch for variation.
+2. **Resize**: 50/50 deterministic (hash of `seed:path`) choice between aspect-ratio-preserving pad (black canvas) and squash to `data.size` × `data.size`. Seed changes each epoch for variation.
 3. Collate returns `(img_u8, pil_rs, keys)` — uint8 tensor for student, PIL list for teacher processor, paths for debugging.
-4. Train/val split is deterministic via stable hash on path.
+4. Train/val split is deterministic via stable hash on path, controlled by `data.val_frac`.
 
 ## Training Step (Manual Optimization)
 
@@ -19,12 +55,12 @@ Each call to `training_step` is one micro-batch:
 
 1. **Teacher forward** (`@torch.no_grad`, fp16 autocast): teacher processor → teacher model → `(t_summary, t_spatial_tokens)`.
 2. **Ramp loss weights** (see Ramps below).
-3. **Student augmentation** on CPU (see Augmentations below), then ImageNet normalize in-place, single `.to(device)` copy.
+3. **Student augmentation** on CPU via albumentations (see Augmentations below), then normalize in-place with `data.normalize.mean/std`, single `.to(device)` copy.
 4. **Student forward + loss** under fp16 autocast.
 5. **Extract log scalars** as Python floats before backward.
 6. **`scaler.scale(loss / grad_accum).backward()`** — graph freed immediately.
 7. **Delete all GPU intermediates** (`del loss, out, s_sum, ...`).
-8. Every `grad_accum` (4) micro-steps: unscale → clip_grad_norm(1.0) → scaler.step → scaler.update → zero_grad(set_to_none=True).
+8. Every `training.grad_accum` micro-steps: unscale → `clip_grad_norm(training.grad_clip)` → scaler.step → scaler.update → `zero_grad(set_to_none=True)`.
 
 ## Loss Function
 
@@ -35,70 +71,72 @@ loss_sp  = cosine_loss(s_tokens, t_tokens) + λ_sp_mse * mse(s_sp, t_sp) + λ_gr
 ```
 
 - `cosine_loss`: `(1 - cos_sim).mean()` on L2-normalized vectors.
-- `sobel_grad_loss`: Sobel edge maps on both student/teacher spatial feature maps, Charbonnier-robust L1 on the difference.
-- Spatial norm capping at 50.0 on student output to prevent hotspots.
+- `sobel_grad_loss`: Sobel edge maps on both student/teacher spatial feature maps, Charbonnier-robust L1 on the difference (eps from `loss.grad_eps`).
+- Spatial norm capping at `model.spatial_norm_cap` on student output to prevent hotspots.
+
+Weights `λ_summary`, `λ_spatial`, `λ_mse` come from `loss.lambda_summary`, `loss.lambda_spatial`, `loss.lambda_mse`. Dynamic weights `λ_sp_mse` and `λ_grad` are ramped (see below).
 
 ## Ramps
 
-All use `ramp_linear(step, warmup_steps, start, end)` — linear interpolation clamped at end.
+All use `ramp_linear(step, warmup_steps, start, end)` — linear interpolation clamped at end. Configured via `loss.ramp` and `augmentation`:
 
-| Weight | Start | End | Warmup | Purpose |
-|---|---|---|---|---|
-| `λ_sp_mse` | 0.5 | 1.5 | 20% of epoch | Ease spatial MSE pressure early |
-| `λ_grad` | 0.1 | 1.3 | 35% of epoch | Let coarse structure form before enforcing edges |
-| `aug_p` | 0.0 | 0.6 | 4000 steps | Let student learn clean mapping first, then add robustness |
+| Weight | Config path | Purpose |
+|---|---|---|
+| `λ_sp_mse` | `loss.ramp.mse_sp_w.{start,end,warmup_frac}` | Ease spatial MSE pressure early |
+| `λ_grad` | `loss.ramp.grad_w.{start,end,warmup_frac}` | Let coarse structure form before enforcing edges |
+| `aug_p` | `augmentation.{warmup_steps,p_start,p_end}` | Let student learn clean mapping first, then add robustness |
+
+Warmup fractions for loss ramps are relative to `loss.ramp.steps_per_epoch`.
 
 ## Augmentations (Student Only)
 
-Applied on CPU to uint8→float32 before normalization. Teacher always sees clean resized images.
+Augmentations use **albumentations** and are defined declaratively in `augmentation.pipeline` in the config YAML. The pipeline is deserialized once at init via `A.from_dict()` and reused every step.
 
-Per-sample gated by `aug_p` (ramped 0→0.6 over 4000 steps). If gated on, each aug applied independently:
+Per-sample gated by `aug_p` (ramped from `augmentation.p_start` → `augmentation.p_end` over `augmentation.warmup_steps`). For gated samples: `torch (3,H,W) uint8 → numpy (H,W,3) uint8 → albumentations pipeline → back to torch float [0,1]`. Non-gated samples are converted directly: `uint8.float() / 255`.
 
-| Augmentation | Probability | Range |
-|---|---|---|
-| Brightness | 0.4 | ±0.1 multiplicative |
-| Contrast | 0.4 | ±0.1 around mean |
-| Color jitter | 0.3 | hue ±0.02, saturation ±0.1 |
-| Gaussian blur | 0.3 | kernel 3 or 5, σ 0.1–0.5 |
-| ISO noise | 0.3 | additive Gaussian, σ=0.02 |
+Teacher always sees clean resized images (no augmentations).
+
+To change augmentations, edit the `augmentation.pipeline` section in `config.yaml`. The format follows `albumentations.from_dict()` / `to_dict()` conventions — each transform has a `__class_fullname__` and its parameters.
 
 ## Validation
 
-- Runs every `eval_every * grad_accum` training batches (e.g. debug: every 20 batches = every 5 optimizer steps).
-- `limit_val_batches` caps how many val batches per run (debug: 5, full: 50).
+- Runs every `logging.eval_every * training.grad_accum` training batches.
+- `logging.eval_batches` caps how many val batches per run.
 - `validation_step` is wrapped in `@torch.no_grad()`. Forward + loss on GPU, then everything moved to CPU for diagnostics. GPU freed + `empty_cache()` after each val epoch.
 - **Accumulators persist across all val runs within a training epoch** — results are only reported once in `on_train_epoch_end`.
 
 ## Logging
 
-### Train (TensorBoard, every `log_every` steps via Lightning)
+### Train (TensorBoard, every `logging.log_every` steps via Lightning)
 - `train/loss`, `train/loss_sum`, `train/loss_sp`, `train/loss_grad`
 - `train/cos_sum`, `train/cos_sp`, `train/mse_sum`, `train/mse_sp`
 - `train/mse_sp_w`, `train/grad_w`, `train/aug_p` (current ramp values)
 
-### Train images (every `log_every * 5` steps)
-- `train/teacher_input`: 8-image grid of un-augmented inputs
-- `train/student_input`: 8-image grid of augmented inputs
+### Train images (every `logging.log_every * logging.image_log_multiplier` steps)
+- `train/teacher_input`: grid of un-augmented inputs (`logging.image_grid.n` images, `logging.image_grid.nrow` per row)
+- `train/student_input`: grid of augmented inputs (same layout)
 
 ### Val (TensorBoard, once per epoch in `on_train_epoch_end`)
 - **Losses**: `val/loss`, `val/loss_sum`, `val/loss_sp`, `val/loss_grad`, `val/cos_sum`, `val/cos_sp`, `val/mse_sum`, `val/mse_sp`
-- **Summary diagnostics**: `val/summary_cos_{mean,p05,p95}`, `val/retrieval_top1`, `val/retrieval_mrr`, `val/summary_linear_cka`, `val/summary_mse_mean`, `val/summary_norm_ratio`, `val/summary_{mean,std}_abs_diff`
-- **Spatial diagnostics**: `val/spatial_cos_{mean,p05,p95}`, `val/spatial_mse_mean`, `val/spatial_norm_ratio`, `val/spatial_style_gram_mse`, `val/spatial_energy_ratio`, `val/spatial_meanD_corr`
-- **Edge/HF diagnostics**: `val/edge_align_corr_{mean,p05,p95}`, `val/hf_cos_mean`, `val/hf_mse_mean`, `val/hf_energy_ratio`
-- **Spatial compare images** (first few val batches): cosine map, L2 map, side-by-side channel grid
+- **Summary diagnostics**: `val/summary_cos_{mean,pXX}`, `val/retrieval_top1`, `val/retrieval_mrr`, `val/summary_linear_cka`, `val/summary_mse_mean`, `val/summary_norm_ratio`, `val/summary_{mean,std}_abs_diff`
+- **Spatial diagnostics**: `val/spatial_cos_{mean,pXX}`, `val/spatial_mse_mean`, `val/spatial_norm_ratio`, `val/spatial_style_gram_mse`, `val/spatial_energy_ratio`, `val/spatial_meanD_corr`
+- **Edge/HF diagnostics**: `val/edge_align_corr_{mean,pXX}`, `val/hf_cos_mean`, `val/hf_mse_mean`, `val/hf_energy_ratio`
+- **Spatial compare images** (batches matching `logging.val_spatial_compare.batch_mod/max_batches`): cosine map, L2 map, side-by-side channel grid (max resolution `logging.val_spatial_compare.max_side`)
+- Quantile suffixes (pXX) are derived from `logging.quantiles` list (e.g. `[0.05, 0.95]` → p05, p95)
 
-### Console (once per epoch)
-- `[VAL] epoch=E step=S loss=X.XXXX loss_sum=X.XXXX loss_sp=X.XXXX (aggregated over N val batches)`
+### Console
+- `[MEM]` prints every `logging.mem_track_interval` steps with allocated/reserved GPU MB
+- `[VAL]` once per epoch: `epoch=E step=S loss=X.XXXX loss_sum=X.XXXX loss_sp=X.XXXX (aggregated over N val batches)`
 
 ## Checkpointing
 
 - Once per epoch, only if val loss improved over best.
 - Saves student, summary head, and spatial head state dicts (not teacher, not optimizer).
-- Path: `{exp_root}/{exp_name}/checkpoints/epoch_E_step_S_val_loss_X.XXX.pth`
+- Path: `{experiment.root}/{exp_name}/checkpoints/epoch_E_step_S_val_loss_X.XXX.pth`
 
 ## Debug Mode
 
-When `--mode debug`: `train_cap=5000`, `val_cap=1000`, `eval_every=5`, `eval_batches=5`, suffix `_debug` appended to experiment name. Config overrides happen in `parse_args`, not in data module.
+When `mode=debug`: the `debug:` overlay from config.yaml is merged (by default: `data.train_cap=5000`, `data.val_cap=1000`, `logging.eval_every=5`, `logging.eval_batches=5`), and `_debug` is appended to the experiment suffix. All debug overrides are configurable in the YAML rather than hardcoded.
 
 ## Memory Management
 

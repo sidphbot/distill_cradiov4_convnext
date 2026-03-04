@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchvision.utils import make_grid
 
-from distill.augment import apply_student_augmentations
+from distill.augment import apply_student_augmentations, build_augmentation_pipeline
 from distill.model import (
     DistillModel,
     LossWeights,
@@ -29,14 +29,11 @@ from distill.model import (
     build_param_groups,
 )
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
-
-def _normalize_batch(x: torch.Tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD) -> torch.Tensor:
-    """Normalize (B,3,H,W) float [0,1] tensor with ImageNet stats. In-place friendly."""
-    m = torch.tensor(mean, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    s = torch.tensor(std, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+def _normalize_batch(x: torch.Tensor, mean, std) -> torch.Tensor:
+    """Normalize (B,3,H,W) float [0,1] tensor. In-place friendly."""
+    m = torch.tensor(list(mean), device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    s = torch.tensor(list(std), device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
     return x.sub_(m).div_(s)
 
 
@@ -67,21 +64,21 @@ class DistillLightningModule(pl.LightningModule):
         self.Wt = Wt
 
         self.loss_w = LossWeights(
-            lambda_summary=cfg.lambda_summary,
-            lambda_spatial=cfg.lambda_spatial,
-            lambda_mse=cfg.lambda_mse,
+            lambda_summary=cfg.loss.lambda_summary,
+            lambda_spatial=cfg.loss.lambda_spatial,
+            lambda_mse=cfg.loss.lambda_mse,
         )
 
         self.best_val_loss = None
 
-        self.checkpoint_dir = Path(cfg.exp_root) / "checkpoints"
+        self.checkpoint_dir = Path(cfg.experiment.root) / "checkpoints"
 
-        # Augmentation ramp params
-        self.aug_warmup_steps = 4000
+        # Build augmentation pipeline once
+        self.aug_pipeline = build_augmentation_pipeline(cfg.augmentation)
 
         # Manual grad accumulation & AMP
-        self._grad_accum = cfg.grad_accum
-        self._scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
+        self._grad_accum = cfg.training.grad_accum
+        self._scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.amp)
         self._micro_step = 0
 
         # Eval accumulators
@@ -110,8 +107,8 @@ class DistillLightningModule(pl.LightningModule):
             proc=self.teacher_proc,
             pil_imgs=pil_rs,
             device=str(device),
-            size=self.cfg.size,
-            amp=self.cfg.teacher_amp,
+            size=self.cfg.data.size,
+            amp=self.cfg.teacher.amp,
         )
         del pil_rs  # free PIL list
         # Flush cached blocks from teacher's huge attention intermediates
@@ -119,45 +116,53 @@ class DistillLightningModule(pl.LightningModule):
         torch.cuda.empty_cache()
 
         # 2. Ramp loss weights
-        steps_per_epoch = 3800
+        steps_per_epoch = self.cfg.loss.ramp.steps_per_epoch
         self.loss_w.lambda_sp_mse = ramp_linear(
             step=self.global_step,
-            warmup_steps=int(self.cfg.mse_sp_w_warmup_frac * steps_per_epoch),
-            start=self.cfg.mse_sp_w_start,
-            end=self.cfg.mse_sp_w_end,
+            warmup_steps=int(self.cfg.loss.ramp.mse_sp_w.warmup_frac * steps_per_epoch),
+            start=self.cfg.loss.ramp.mse_sp_w.start,
+            end=self.cfg.loss.ramp.mse_sp_w.end,
         )
         self.loss_w.lambda_grad = ramp_linear(
             step=self.global_step,
-            warmup_steps=int(self.cfg.grad_w_warmup_frac * steps_per_epoch),
-            start=self.cfg.grad_w_start,
-            end=self.cfg.grad_w_end,
+            warmup_steps=int(self.cfg.loss.ramp.grad_w.warmup_frac * steps_per_epoch),
+            start=self.cfg.loss.ramp.grad_w.start,
+            end=self.cfg.loss.ramp.grad_w.end,
         )
 
         # 3. Augment student input ON CPU, then move normalized result to GPU
-        aug_p = ramp_linear(self.global_step, self.aug_warmup_steps, 0.0, 0.6)
+        aug_p = ramp_linear(
+            self.global_step,
+            self.cfg.augmentation.warmup_steps,
+            self.cfg.augmentation.p_start,
+            self.cfg.augmentation.p_end,
+        )
 
         # Periodically log image grids (before we consume img_u8)
-        log_images = (self.global_step % (self.cfg.log_every * 5) == 0 and self.global_step > 0)
+        log_images = (
+            self.global_step % (self.cfg.logging.log_every * self.cfg.logging.image_log_multiplier) == 0
+            and self.global_step > 0
+        )
 
-        x_float = apply_student_augmentations(img_u8, aug_p)  # CPU: (B,3,H,W) float [0,1]
+        x_float = apply_student_augmentations(img_u8, aug_p, self.aug_pipeline)  # CPU: (B,3,H,W) float [0,1]
 
         if log_images:
             self._log_image_grids(img_u8, x_float, "train")
 
         del img_u8  # free CPU uint8 batch
 
-        x = _normalize_batch(x_float)  # in-place on CPU float
+        x = _normalize_batch(x_float, self.cfg.data.normalize.mean, self.cfg.data.normalize.std)
         x = x.to(device, non_blocking=True)  # single GPU copy
 
         # 4. Forward + loss under autocast
         t_summary = t_summary.to(device, non_blocking=True).float()
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
-        with torch.amp.autocast("cuda", enabled=self.cfg.amp):
+        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
             s_sum, s_tokens, s_sp, (f2, f3) = self.model(x)
             out = compute_losses(
                 s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens,
-                self.loss_w, self.cfg.grad_eps, self.Ht, self.Wt,
+                self.loss_w, self.cfg.loss.grad_eps, self.Ht, self.Wt,
             )
             loss = out["loss"] / self._grad_accum
 
@@ -179,7 +184,7 @@ class DistillLightningModule(pl.LightningModule):
         # 8. Optimizer step every grad_accum micro-steps
         if self._micro_step >= self._grad_accum:
             self._scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.grad_clip)
             self._scaler.step(opt)
             self._scaler.update()
             opt.zero_grad(set_to_none=True)
@@ -191,8 +196,8 @@ class DistillLightningModule(pl.LightningModule):
         for k, v in log_vals.items():
             tb.add_scalar(f"train/{k}", v, step)
 
-        # Memory tracking — print every 10 steps to spot leaks
-        if step % 10 == 0 and torch.cuda.is_available():
+        # Memory tracking
+        if step % self.cfg.logging.mem_track_interval == 0 and torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / 1024**2
             resv = torch.cuda.memory_reserved() / 1024**2
             print(f"[MEM] step={step} allocated={alloc:.0f}MB reserved={resv:.0f}MB")
@@ -208,25 +213,25 @@ class DistillLightningModule(pl.LightningModule):
             proc=self.teacher_proc,
             pil_imgs=pil_rs,
             device=str(device),
-            size=self.cfg.size,
-            amp=self.cfg.teacher_amp,
+            size=self.cfg.data.size,
+            amp=self.cfg.teacher.amp,
         )
         del pil_rs
 
         # Student: no augmentations, normalize on CPU then move to GPU
         x = img_u8.float().div_(255.0)
         del img_u8
-        _normalize_batch(x)  # in-place
+        _normalize_batch(x, self.cfg.data.normalize.mean, self.cfg.data.normalize.std)
         x = x.to(device, non_blocking=True)
 
         t_summary = t_summary.to(device, non_blocking=True).float()
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
-        with torch.amp.autocast("cuda", enabled=self.cfg.amp):
+        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
             s_sum, s_tokens, s_sp, _ = self.model(x)
             out = compute_losses(
                 s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens,
-                self.loss_w, self.cfg.grad_eps, self.Ht, self.Wt,
+                self.loss_w, self.cfg.loss.grad_eps, self.Ht, self.Wt,
             )
 
         # Accumulate losses as floats
@@ -237,7 +242,8 @@ class DistillLightningModule(pl.LightningModule):
         del out
 
         # Spatial compare logs for first few batches (uses GPU tensors, do before moving to CPU)
-        if batch_idx % 3 == 0 and batch_idx < 15:
+        vsc = self.cfg.logging.val_spatial_compare
+        if batch_idx % vsc.batch_mod == 0 and batch_idx < vsc.max_batches:
             tb = self.logger.experiment
             log_spatial_compare_first_sample(
                 tb_writer=tb,
@@ -247,7 +253,7 @@ class DistillLightningModule(pl.LightningModule):
                 Ht=self.Ht,
                 Wt=self.Wt,
                 tag_prefix=f"eval/spatial_compare_{batch_idx}_first",
-                max_side=512,
+                max_side=vsc.max_side,
             )
 
         # Move everything to CPU for diagnostics, free GPU immediately
@@ -330,6 +336,7 @@ class DistillLightningModule(pl.LightningModule):
 
         tb = self.logger.experiment
         step = self.global_step
+        quantiles = list(self.cfg.logging.quantiles)
 
         # Mean losses
         val_loss = self._val_agg.get("loss", 0.0) / n
@@ -340,20 +347,20 @@ class DistillLightningModule(pl.LightningModule):
         if self._val_summary_cos:
             cat = torch.cat(self._val_summary_cos, dim=0)
             tb.add_scalar("val/summary_cos_mean", cat.mean().item(), step)
-            tb.add_scalar("val/summary_cos_p05", torch.quantile(cat, 0.05).item(), step)
-            tb.add_scalar("val/summary_cos_p95", torch.quantile(cat, 0.95).item(), step)
+            for q in quantiles:
+                tb.add_scalar(f"val/summary_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
 
         if self._val_spatial_cos:
             cat = torch.cat(self._val_spatial_cos, dim=0)
             tb.add_scalar("val/spatial_cos_mean", cat.mean().item(), step)
-            tb.add_scalar("val/spatial_cos_p05", torch.quantile(cat, 0.05).item(), step)
-            tb.add_scalar("val/spatial_cos_p95", torch.quantile(cat, 0.95).item(), step)
+            for q in quantiles:
+                tb.add_scalar(f"val/spatial_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
 
         if self._val_edge_corr:
             cat = torch.cat(self._val_edge_corr, dim=0)
             tb.add_scalar("val/edge_align_corr_mean", cat.mean().item(), step)
-            tb.add_scalar("val/edge_align_corr_p05", torch.quantile(cat, 0.05).item(), step)
-            tb.add_scalar("val/edge_align_corr_p95", torch.quantile(cat, 0.95).item(), step)
+            for q in quantiles:
+                tb.add_scalar(f"val/edge_align_corr_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
 
         # Scalar means
         for k, v in self._val_scalar_sums.items():
@@ -390,10 +397,14 @@ class DistillLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         params = []
-        params += build_param_groups(self.model.student, self.cfg.wd)
-        params += build_param_groups(self.model.sum_head, self.cfg.wd)
-        params += build_param_groups(self.model.sp_head, self.cfg.wd)
-        opt = torch.optim.AdamW(params, lr=self.cfg.lr, betas=(0.9, 0.999), eps=1e-8)
+        params += build_param_groups(self.model.student, self.cfg.training.wd)
+        params += build_param_groups(self.model.sum_head, self.cfg.training.wd)
+        params += build_param_groups(self.model.sp_head, self.cfg.training.wd)
+        betas = tuple(self.cfg.training.optimizer.betas)
+        opt = torch.optim.AdamW(
+            params, lr=self.cfg.training.lr,
+            betas=betas, eps=self.cfg.training.optimizer.eps,
+        )
         return opt
 
     def _save_checkpoint(self, step: int, val_loss: float):
@@ -401,9 +412,9 @@ class DistillLightningModule(pl.LightningModule):
         save_path = self.checkpoint_dir / f"epoch_{self.current_epoch}_step_{step}_val_loss_{val_loss:.3f}.pth"
         torch.save(
             {
-                "student_name": self.cfg.student_variant,
-                "size": self.cfg.size,
-                "patch_size": self.cfg.patch_size,
+                "student_name": self.cfg.model.student_variant,
+                "size": self.cfg.data.size,
+                "patch_size": self.cfg.data.patch_size,
                 "teacher_summary_dim": self.model.sum_head.fc.out_features,
                 "teacher_spatial_dim": self.model.sp_head.conv.out_channels,
                 "student_state_dict": self.model.student.state_dict(),
@@ -419,14 +430,15 @@ class DistillLightningModule(pl.LightningModule):
         """Log teacher (un-augmented) and student (augmented) input grids. Both on CPU."""
         tb = self.logger.experiment
         step = self.global_step
-        n = min(8, img_u8.shape[0])
+        ig = self.cfg.logging.image_grid
+        n = min(ig.n, img_u8.shape[0])
 
         # Teacher input: original uint8 -> [0,1]
         teacher_imgs = img_u8[:n].float().div(255.0)
-        teacher_grid = make_grid(teacher_imgs, nrow=4, normalize=False)
+        teacher_grid = make_grid(teacher_imgs, nrow=ig.nrow, normalize=False)
         tb.add_image(f"{prefix}/teacher_input", teacher_grid, step)
 
         # Student input: augmented float [0,1]
         student_imgs = x_augmented[:n].detach()
-        student_grid = make_grid(student_imgs, nrow=4, normalize=False)
+        student_grid = make_grid(student_imgs, nrow=ig.nrow, normalize=False)
         tb.add_image(f"{prefix}/student_input", student_grid, step)

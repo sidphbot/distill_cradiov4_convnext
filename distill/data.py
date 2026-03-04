@@ -136,15 +136,15 @@ class DistillDataModule(pl.LightningDataModule):
         self.val_ds = None
 
     def setup(self, stage=None):
-        all_paths = read_image_list(self.cfg.data_list)
+        all_paths = read_image_list(self.cfg.data.data_list)
         train_paths, val_paths = split_paths_deterministic(
-            all_paths, val_frac=self.cfg.val_frac, seed=self.cfg.seed,
+            all_paths, val_frac=self.cfg.data.val_frac, seed=self.cfg.seed,
         )
 
-        if getattr(self.cfg, "train_cap", 0) > 0:
-            train_paths = train_paths[:self.cfg.train_cap]
-        if getattr(self.cfg, "val_cap", 0) > 0:
-            val_paths = val_paths[:self.cfg.val_cap]
+        if getattr(self.cfg.data, "train_cap", 0) > 0:
+            train_paths = train_paths[:self.cfg.data.train_cap]
+        if getattr(self.cfg.data, "val_cap", 0) > 0:
+            val_paths = val_paths[:self.cfg.data.val_cap]
 
         print(f"[{self.cfg.mode.upper()}][ONLINE] train={len(train_paths)} val={len(val_paths)}")
 
@@ -152,27 +152,27 @@ class DistillDataModule(pl.LightningDataModule):
         self.val_ds = ImagePathDataset(val_paths)
 
     def train_dataloader(self):
-        collate = OnlineCollate(self.train_ds, size=self.cfg.size)
+        collate = OnlineCollate(self.train_ds, size=self.cfg.data.size)
         return DataLoader(
             self.train_ds,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.cfg.dataloader.batch_size,
             shuffle=True,
-            num_workers=self.cfg.num_workers,
+            num_workers=self.cfg.dataloader.num_workers,
             pin_memory=True,
             collate_fn=collate,
-            persistent_workers=self.cfg.persistent_workers and self.cfg.num_workers > 0,
-            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
+            persistent_workers=self.cfg.dataloader.persistent_workers and self.cfg.dataloader.num_workers > 0,
+            prefetch_factor=self.cfg.dataloader.prefetch_factor if self.cfg.dataloader.num_workers > 0 else None,
         )
 
     def val_dataloader(self):
-        collate = OnlineCollate(self.val_ds, size=self.cfg.size)
+        collate = OnlineCollate(self.val_ds, size=self.cfg.data.size)
         return DataLoader(
             self.val_ds,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.cfg.dataloader.batch_size,
             shuffle=False,
-            num_workers=self.cfg.num_workers,
+            num_workers=self.cfg.dataloader.num_workers,
             pin_memory=True,
             collate_fn=collate,
-            persistent_workers=self.cfg.persistent_workers and self.cfg.num_workers > 0,
-            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
+            persistent_workers=self.cfg.dataloader.persistent_workers and self.cfg.dataloader.num_workers > 0,
+            prefetch_factor=self.cfg.dataloader.prefetch_factor if self.cfg.dataloader.num_workers > 0 else None,
         )
