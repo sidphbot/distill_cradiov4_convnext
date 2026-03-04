@@ -90,7 +90,7 @@ total_loss = distill_loss + loss_consistency
 - Spatial norm capping at `model.spatial_norm_cap` on student output to prevent hotspots.
 - **Consistency loss**: enforces augmentation invariance by pushing augmented student outputs to match clean student outputs (detached). Separate lambdas for summary and spatial.
 
-Weights `λ_summary`, `λ_spatial`, `λ_mse` come from `loss.lambda_summary`, `loss.lambda_spatial`, `loss.lambda_mse`. Dynamic weights `λ_sp_mse` and `λ_grad` are ramped (see below). Consistency weights `λ_cs` and `λ_csp` come from `loss.lambda_consistency_summary` and `loss.lambda_consistency_spatial`.
+Weights `λ_summary`, `λ_spatial`, `λ_mse` come from `loss.lambda_summary`, `loss.lambda_spatial`, `loss.lambda_mse`. All dynamic weights (`λ_sp_mse`, `λ_grad`, `λ_cs`, `λ_csp`) are ramped (see below).
 
 ## Ramps
 
@@ -98,17 +98,19 @@ All use `ramp_linear(step, warmup_steps, start, end)` — linear interpolation c
 
 | Weight | Config path | Purpose |
 |---|---|---|
-| `λ_sp_mse` | `loss.ramp.mse_sp_w.{start,end,warmup_frac}` | Ease spatial MSE pressure early |
-| `λ_grad` | `loss.ramp.grad_w.{start,end,warmup_frac}` | Let coarse structure form before enforcing edges |
-| `aug_p` | `augmentation.{warmup_steps,p_start,p_end}` | Let student learn clean mapping first, then add robustness |
+| `λ_sp_mse` | `loss.ramp.mse_sp.{start,end,warmup_frac}` | Ease spatial MSE pressure early |
+| `λ_grad` | `loss.ramp.grad.{start,end,warmup_frac}` | Let coarse structure form before enforcing edges |
+| `λ_cs` | `loss.ramp.cons_summary.{start,end,warmup_frac}` | Summary consistency weight (ramps 2x faster than spatial) |
+| `λ_csp` | `loss.ramp.cons_spatial.{start,end,warmup_frac}` | Spatial consistency weight |
+| `aug_strength` | `augmentation.{warmup_frac,strength_start,strength_end}` | Ramp augmentation intensity — alpha-blend between clean and augmented |
 
-Warmup fractions for loss ramps are relative to `loss.ramp.steps_per_epoch`.
+All `warmup_frac` values are fractions of the first epoch's step count (auto-computed from `len(train_dataset) / batch_size`).
 
 ## Augmentations (Student Only)
 
 Augmentations use **albumentations** and are defined declaratively in `augmentation.pipeline` in the config YAML. The pipeline is deserialized once at init via `A.from_dict()` and reused every step.
 
-Per-sample gated by `aug_p` (ramped from `augmentation.p_start` → `augmentation.p_end` over `augmentation.warmup_steps`). For gated samples: `torch (3,H,W) uint8 → numpy (H,W,3) uint8 → albumentations pipeline → back to torch float [0,1]`. Non-gated samples are converted directly: `uint8.float() / 255`.
+Every sample is always augmented through the pipeline. The output is alpha-blended between clean and augmented: `(1-s)*clean + s*aug`, where `s` (strength) ramps from `augmentation.strength_start` → `augmentation.strength_end` over `augmentation.warmup_frac` of the first epoch. This ensures consistency loss always has gradient signal while smoothly increasing augmentation intensity.
 
 Teacher always sees clean resized images (no augmentations).
 
@@ -124,17 +126,18 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 ## Logging
 
 ### Train (TensorBoard, every `logging.log_every` steps via Lightning)
-- `train/loss`, `train/loss_sum`, `train/loss_sp`, `train/loss_grad`
-- `train/cos_sum`, `train/cos_sp`, `train/mse_sum`, `train/mse_sp`
-- `train/mse_sp_w`, `train/grad_w`, `train/aug_p` (current ramp values)
-- `train/cons_summary`, `train/cons_spatial`, `train/loss_consistency` (consistency loss terms)
+- `train/loss`, `train/loss_sum`, `train/loss_sp` (weighted compound losses)
+- `train/cos_sum`, `train/cos_sp`, `train/mse_sum`, `train/mse_sp`, `train/grad` (raw loss components)
+- `train/cons_summary`, `train/cons_spatial`, `train/loss_cons` (consistency loss terms)
+- `train/w/mse_sp`, `train/w/grad`, `train/w/cons_summary`, `train/w/cons_spatial` (current ramp weights)
+- `train/aug_strength` (current augmentation strength)
 
 ### Train images (every `logging.log_every * logging.image_log_multiplier` steps)
 - `train/teacher_input`: grid of un-augmented inputs (`logging.image_grid.n` images, `logging.image_grid.nrow` per row)
 - `train/student_input`: grid of augmented inputs (same layout)
 
 ### Val (TensorBoard, once per epoch in `on_train_epoch_end`)
-- **Losses**: `val/loss`, `val/loss_sum`, `val/loss_sp`, `val/loss_grad`, `val/cos_sum`, `val/cos_sp`, `val/mse_sum`, `val/mse_sp`
+- **Losses**: `val/loss`, `val/loss_sum`, `val/loss_sp`, `val/cos_sum`, `val/cos_sp`, `val/mse_sum`, `val/mse_sp`, `val/grad`
 - **Summary diagnostics**: `val/summary_cos_{mean,pXX}`, `val/retrieval_top1`, `val/retrieval_mrr`, `val/summary_linear_cka`, `val/summary_mse_mean`, `val/summary_norm_ratio`, `val/summary_{mean,std}_abs_diff`
 - **Spatial diagnostics**: `val/spatial_cos_{mean,pXX}`, `val/spatial_mse_mean`, `val/spatial_norm_ratio`, `val/spatial_style_gram_mse`, `val/spatial_energy_ratio`, `val/spatial_meanD_corr`
 - **Edge/HF diagnostics**: `val/edge_align_corr_{mean,pXX}`, `val/hf_cos_mean`, `val/hf_mse_mean`, `val/hf_energy_ratio`

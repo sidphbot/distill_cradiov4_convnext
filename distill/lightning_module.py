@@ -51,6 +51,7 @@ class DistillLightningModule(pl.LightningModule):
         Dt: int,
         Ht: int,
         Wt: int,
+        steps_per_epoch: int = 1,
     ):
         super().__init__()
         self.automatic_optimization = False  # manual opt to match old loop memory profile
@@ -92,6 +93,7 @@ class DistillLightningModule(pl.LightningModule):
         self._val_edge_corr = []
         self._val_scalar_sums = {}
 
+        self._steps_per_epoch = steps_per_epoch
         self._cached_opt = None
 
     def forward(self, x):
@@ -118,27 +120,27 @@ class DistillLightningModule(pl.LightningModule):
         # so student can allocate contiguous memory for forward+backward
         torch.cuda.empty_cache()
 
-        # 2. Ramp loss weights
-        steps_per_epoch = self.cfg.loss.ramp.steps_per_epoch
+        # 2. Ramp loss weights (warmup_frac is fraction of first epoch)
+        spe = self._steps_per_epoch
         self.loss_w.lambda_sp_mse = ramp_linear(
             step=self.global_step,
-            warmup_steps=int(self.cfg.loss.ramp.mse_sp_w.warmup_frac * steps_per_epoch),
-            start=self.cfg.loss.ramp.mse_sp_w.start,
-            end=self.cfg.loss.ramp.mse_sp_w.end,
+            warmup_steps=int(self.cfg.loss.ramp.mse_sp.warmup_frac * spe),
+            start=self.cfg.loss.ramp.mse_sp.start,
+            end=self.cfg.loss.ramp.mse_sp.end,
         )
         self.loss_w.lambda_grad = ramp_linear(
             step=self.global_step,
-            warmup_steps=int(self.cfg.loss.ramp.grad_w.warmup_frac * steps_per_epoch),
-            start=self.cfg.loss.ramp.grad_w.start,
-            end=self.cfg.loss.ramp.grad_w.end,
+            warmup_steps=int(self.cfg.loss.ramp.grad.warmup_frac * spe),
+            start=self.cfg.loss.ramp.grad.start,
+            end=self.cfg.loss.ramp.grad.end,
         )
 
         # 3. Prepare clean and augmented inputs on CPU
-        aug_p = ramp_linear(
+        aug_strength = ramp_linear(
             self.global_step,
-            self.cfg.augmentation.warmup_steps,
-            self.cfg.augmentation.p_start,
-            self.cfg.augmentation.p_end,
+            int(self.cfg.augmentation.warmup_frac * spe),
+            self.cfg.augmentation.strength_start,
+            self.cfg.augmentation.strength_end,
         )
 
         # Periodically log image grids (before we consume img_u8)
@@ -150,8 +152,8 @@ class DistillLightningModule(pl.LightningModule):
         # Clean input: float/255 + normalize (no augmentation)
         x_clean_float = img_u8.float().div_(255.0)  # CPU: (B,3,H,W) float [0,1]
 
-        # Augmented input
-        x_aug_float = apply_student_augmentations(img_u8, aug_p, self.aug_pipeline)  # CPU: (B,3,H,W) float [0,1]
+        # Augmented input (alpha-blended by strength)
+        x_aug_float = apply_student_augmentations(img_u8, aug_strength, self.aug_pipeline)  # CPU: (B,3,H,W) float [0,1]
 
         if log_images:
             self._log_image_grids(img_u8, x_aug_float, "train")
@@ -170,8 +172,18 @@ class DistillLightningModule(pl.LightningModule):
         t_summary = t_summary.to(device, non_blocking=True).float()
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
-        lambda_cs = self.cfg.loss.lambda_consistency_summary
-        lambda_csp = self.cfg.loss.lambda_consistency_spatial
+        lambda_cs = ramp_linear(
+            step=self.global_step,
+            warmup_steps=int(self.cfg.loss.ramp.cons_summary.warmup_frac * spe),
+            start=self.cfg.loss.ramp.cons_summary.start,
+            end=self.cfg.loss.ramp.cons_summary.end,
+        )
+        lambda_csp = ramp_linear(
+            step=self.global_step,
+            warmup_steps=int(self.cfg.loss.ramp.cons_spatial.warmup_frac * spe),
+            start=self.cfg.loss.ramp.cons_spatial.start,
+            end=self.cfg.loss.ramp.cons_spatial.end,
+        )
 
         # --- Phase A: clean forward → distill loss → backward (frees clean graph) ---
         with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
@@ -204,10 +216,12 @@ class DistillLightningModule(pl.LightningModule):
 
         log_vals["cons_summary"] = cons_summary.item()
         log_vals["cons_spatial"] = cons_spatial.item()
-        log_vals["loss_consistency"] = (lambda_cs * cons_summary.item() + lambda_csp * cons_spatial.item())
-        log_vals["mse_sp_w"] = self.loss_w.lambda_sp_mse
-        log_vals["grad_w"] = self.loss_w.lambda_grad
-        log_vals["aug_p"] = aug_p
+        log_vals["loss_cons"] = (lambda_cs * cons_summary.item() + lambda_csp * cons_spatial.item())
+        log_vals["w/mse_sp"] = self.loss_w.lambda_sp_mse
+        log_vals["w/grad"] = self.loss_w.lambda_grad
+        log_vals["w/cons_summary"] = lambda_cs
+        log_vals["w/cons_spatial"] = lambda_csp
+        log_vals["aug_strength"] = aug_strength
 
         self._scaler.scale(loss_consistency).backward()
         del loss_consistency, cons_summary, cons_spatial

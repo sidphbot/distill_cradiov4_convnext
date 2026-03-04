@@ -446,7 +446,7 @@ def compute_losses(
         "loss": loss,
         "loss_sum": loss_sum,
         "loss_sp": loss_sp,
-        "loss_grad": grad_loss,
+        "grad": grad_loss,
         "cos_sum": cos_sum,
         "cos_sp": cos_sp,
         "mse_sum": mse_sum,

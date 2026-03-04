@@ -157,7 +157,12 @@ def main():
     student_name = cfg.model.student_models[cfg.model.student_variant]
     model = build_model(cfg, device, Ct, Dt, Ht, Wt, student_name)
 
-    # 5. Create Lightning module
+    # 5. Compute steps per epoch (micro-batch calls to training_step)
+    import math
+    steps_per_epoch = math.ceil(len(dm.train_ds) / cfg.dataloader.batch_size)
+    print(f"Steps per epoch: {steps_per_epoch} ({len(dm.train_ds)} samples / bs {cfg.dataloader.batch_size})")
+
+    # 6. Create Lightning module
     suffix = cfg.experiment.get("suffix", "")
     exp_name = f"exp_{time.strftime('%Y%m%d%H%M')}_{suffix}" if suffix else f"exp_{time.strftime('%Y%m%d%H%M')}"
     lit_module = DistillLightningModule(
@@ -166,10 +171,11 @@ def main():
         teacher=teacher,
         teacher_proc=teacher_proc,
         Ct=Ct, Dt=Dt, Ht=Ht, Wt=Wt,
+        steps_per_epoch=steps_per_epoch,
     )
     lit_module.checkpoint_dir = Path(cfg.experiment.root) / exp_name / "checkpoints"
 
-    # 6. Logger & Trainer
+    # 7. Logger & Trainer
     tb_logger = TensorBoardLogger(
         save_dir=str(Path(cfg.experiment.root) / exp_name),
         name="tb",
@@ -184,7 +190,7 @@ def main():
         enable_progress_bar=True,
     )
 
-    # 7. Train
+    # 8. Train
     trainer.fit(lit_module, datamodule=dm)
 
 
