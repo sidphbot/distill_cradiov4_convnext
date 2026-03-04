@@ -12,6 +12,9 @@ from distill.model import (
     DistillModel,
     LossWeights,
     compute_losses,
+    cosine_loss,
+    cosine_loss_spatial_tokens,
+    spatial_to_tokens,
     ramp_linear,
     teacher_forward_fixed,
     log_spatial_compare_first_sample,
@@ -130,7 +133,7 @@ class DistillLightningModule(pl.LightningModule):
             end=self.cfg.loss.ramp.grad_w.end,
         )
 
-        # 3. Augment student input ON CPU, then move normalized result to GPU
+        # 3. Prepare clean and augmented inputs on CPU
         aug_p = ramp_linear(
             self.global_step,
             self.cfg.augmentation.warmup_steps,
@@ -144,40 +147,72 @@ class DistillLightningModule(pl.LightningModule):
             and self.global_step > 0
         )
 
-        x_float = apply_student_augmentations(img_u8, aug_p, self.aug_pipeline)  # CPU: (B,3,H,W) float [0,1]
+        # Clean input: float/255 + normalize (no augmentation)
+        x_clean_float = img_u8.float().div_(255.0)  # CPU: (B,3,H,W) float [0,1]
+
+        # Augmented input
+        x_aug_float = apply_student_augmentations(img_u8, aug_p, self.aug_pipeline)  # CPU: (B,3,H,W) float [0,1]
 
         if log_images:
-            self._log_image_grids(img_u8, x_float, "train")
+            self._log_image_grids(img_u8, x_aug_float, "train")
 
         del img_u8  # free CPU uint8 batch
 
-        x = _normalize_batch(x_float, self.cfg.data.normalize.mean, self.cfg.data.normalize.std)
-        x = x.to(device, non_blocking=True)  # single GPU copy
+        x_clean = _normalize_batch(x_clean_float, self.cfg.data.normalize.mean, self.cfg.data.normalize.std)
+        x_clean = x_clean.to(device, non_blocking=True)
+        del x_clean_float
 
-        # 4. Forward + loss under autocast
+        x_aug = _normalize_batch(x_aug_float, self.cfg.data.normalize.mean, self.cfg.data.normalize.std)
+        x_aug = x_aug.to(device, non_blocking=True)
+        del x_aug_float
+
+        # 4. Dual student forward + losses under autocast
         t_summary = t_summary.to(device, non_blocking=True).float()
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
+        lambda_cs = self.cfg.loss.lambda_consistency_summary
+        lambda_csp = self.cfg.loss.lambda_consistency_spatial
+
+        # --- Phase A: clean forward → distill loss → backward (frees clean graph) ---
         with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
-            s_sum, s_tokens, s_sp, (f2, f3) = self.model(x)
+            s_sum_c, s_tokens_c, s_sp_c, (f2, f3) = self.model(x_clean)
+            del x_clean, f2, f3
+
             out = compute_losses(
-                s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens,
+                s_sum_c, s_tokens_c, s_sp_c, t_summary, t_spatial_tokens,
                 self.loss_w, self.cfg.loss.grad_eps, self.Ht, self.Wt,
             )
-            loss = out["loss"] / self._grad_accum
+            distill_loss = out["loss"] / self._grad_accum
 
-        # 5. Extract scalars BEFORE backward so we can free everything after
         log_vals = {k: v.item() for k, v in out.items()}
+
+        # Detach clean outputs as consistency targets BEFORE backward frees the graph
+        s_sum_c_det = s_sum_c.detach()
+        s_tokens_c_det = s_tokens_c.detach()
+
+        self._scaler.scale(distill_loss).backward()
+        del distill_loss, out, s_sum_c, s_tokens_c, s_sp_c
+
+        # --- Phase B: augmented forward → consistency loss → backward ---
+        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
+            s_sum_a, s_tokens_a, s_sp_a, _ = self.model(x_aug)
+            del x_aug, s_sp_a
+
+            cons_summary = cosine_loss(s_sum_a, s_sum_c_det)
+            cons_spatial = cosine_loss_spatial_tokens(s_tokens_a, s_tokens_c_det)
+            loss_consistency = (lambda_cs * cons_summary + lambda_csp * cons_spatial) / self._grad_accum
+
+        log_vals["cons_summary"] = cons_summary.item()
+        log_vals["cons_spatial"] = cons_spatial.item()
+        log_vals["loss_consistency"] = (lambda_cs * cons_summary.item() + lambda_csp * cons_spatial.item())
         log_vals["mse_sp_w"] = self.loss_w.lambda_sp_mse
         log_vals["grad_w"] = self.loss_w.lambda_grad
         log_vals["aug_p"] = aug_p
 
-        # 6. Scaled backward — frees graph immediately
-        self._scaler.scale(loss).backward()
-
-        # 7. Free all forward intermediates now that graph is released
-        del loss, out, s_sum, s_tokens, s_sp, f2, f3
-        del x, t_summary, t_spatial_tokens
+        self._scaler.scale(loss_consistency).backward()
+        del loss_consistency, cons_summary, cons_spatial
+        del s_sum_a, s_tokens_a, s_sum_c_det, s_tokens_c_det
+        del t_summary, t_spatial_tokens
 
         self._micro_step += 1
 

@@ -36,7 +36,7 @@ All training parameters are in `distill/config.yaml`. Key sections:
 | `data` | Data list path, image dir, val fraction, input size, patch size, data caps, normalization stats |
 | `dataloader` | Batch size, num workers, persistent workers, prefetch factor |
 | `training` | Epochs, LR, weight decay, AMP, grad accumulation, grad clip, optimizer betas/eps |
-| `loss` | Lambda weights, grad eps, ramp schedules (start/end/warmup_frac), steps per epoch |
+| `loss` | Lambda weights (distillation + consistency), grad eps, ramp schedules (start/end/warmup_frac), steps per epoch |
 | `augmentation` | Warmup steps, probability ramp (p_start → p_end), albumentations pipeline definition |
 | `logging` | Log frequency, eval frequency/batches, image grid settings, spatial compare settings, mem tracking interval, quantile list |
 | `experiment` | Output root directory, experiment suffix |
@@ -51,30 +51,46 @@ All training parameters are in `distill/config.yaml`. Key sections:
 
 ## Training Step (Manual Optimization)
 
-Each call to `training_step` is one micro-batch:
+Each call to `training_step` is one micro-batch with a **dual student pass**:
 
 1. **Teacher forward** (`@torch.no_grad`, fp16 autocast): teacher processor → teacher model → `(t_summary, t_spatial_tokens)`.
 2. **Ramp loss weights** (see Ramps below).
-3. **Student augmentation** on CPU via albumentations (see Augmentations below), then normalize in-place with `data.normalize.mean/std`, single `.to(device)` copy.
-4. **Student forward + loss** under fp16 autocast.
-5. **Extract log scalars** as Python floats before backward.
-6. **`scaler.scale(loss / grad_accum).backward()`** — graph freed immediately.
-7. **Delete all GPU intermediates** (`del loss, out, s_sum, ...`).
-8. Every `training.grad_accum` micro-steps: unscale → `clip_grad_norm(training.grad_clip)` → scaler.step → scaler.update → `zero_grad(set_to_none=True)`.
+3. **Prepare two inputs on CPU**:
+   - `x_clean`: `img_u8.float()/255 → normalize` (no augmentation)
+   - `x_aug`: `apply_student_augmentations → normalize`
+4. **Clean student forward** under fp16 autocast → `(s_sum_c, s_tokens_c, s_sp_c, (f2, f3))` — used for distillation losses against teacher.
+5. **Distillation loss**: `compute_losses(s_sum_c, s_tokens_c, s_sp_c, ...)` — same as before, on clean outputs.
+6. **Augmented student forward** under fp16 autocast → `(s_sum_a, s_tokens_a, s_sp_a, _)`.
+7. **Consistency loss** (augmentation invariance regularizer):
+   - `cons_summary = cosine_loss(s_sum_a, s_sum_c.detach())`
+   - `cons_spatial = cosine_loss_spatial_tokens(s_tokens_a, s_tokens_c.detach())`
+   - Clean outputs are `.detach()`'d so gradients only push the augmented path to match clean, not vice versa.
+8. **Total loss**: `loss = distill_loss + λ_cs * cons_summary + λ_csp * cons_spatial`.
+9. **Extract log scalars** as Python floats before backward.
+10. **`scaler.scale(loss / grad_accum).backward()`** — graph freed immediately.
+11. **Delete all GPU intermediates**.
+12. Every `training.grad_accum` micro-steps: unscale → `clip_grad_norm(training.grad_clip)` → scaler.step → scaler.update → `zero_grad(set_to_none=True)`.
 
 ## Loss Function
 
 ```
-loss = λ_summary * loss_sum + λ_spatial * loss_sp
-loss_sum = cosine_loss(s_sum, t_sum) + λ_mse * mse(s_sum, t_sum)
-loss_sp  = cosine_loss(s_tokens, t_tokens) + λ_sp_mse * mse(s_sp, t_sp) + λ_grad * sobel_grad_loss(s_sp, t_sp)
+distill_loss = λ_summary * loss_sum + λ_spatial * loss_sp
+loss_sum = cosine_loss(s_sum_c, t_sum) + λ_mse * mse(s_sum_c, t_sum)
+loss_sp  = cosine_loss(s_tokens_c, t_tokens) + λ_sp_mse * mse(s_sp_c, t_sp) + λ_grad * sobel_grad_loss(s_sp_c, t_sp)
+
+cons_summary = cosine_loss(s_sum_a, s_sum_c.detach())
+cons_spatial = cosine_loss_spatial_tokens(s_tokens_a, s_tokens_c.detach())
+loss_consistency = λ_cs * cons_summary + λ_csp * cons_spatial
+
+total_loss = distill_loss + loss_consistency
 ```
 
 - `cosine_loss`: `(1 - cos_sim).mean()` on L2-normalized vectors.
 - `sobel_grad_loss`: Sobel edge maps on both student/teacher spatial feature maps, Charbonnier-robust L1 on the difference (eps from `loss.grad_eps`).
 - Spatial norm capping at `model.spatial_norm_cap` on student output to prevent hotspots.
+- **Consistency loss**: enforces augmentation invariance by pushing augmented student outputs to match clean student outputs (detached). Separate lambdas for summary and spatial.
 
-Weights `λ_summary`, `λ_spatial`, `λ_mse` come from `loss.lambda_summary`, `loss.lambda_spatial`, `loss.lambda_mse`. Dynamic weights `λ_sp_mse` and `λ_grad` are ramped (see below).
+Weights `λ_summary`, `λ_spatial`, `λ_mse` come from `loss.lambda_summary`, `loss.lambda_spatial`, `loss.lambda_mse`. Dynamic weights `λ_sp_mse` and `λ_grad` are ramped (see below). Consistency weights `λ_cs` and `λ_csp` come from `loss.lambda_consistency_summary` and `loss.lambda_consistency_spatial`.
 
 ## Ramps
 
@@ -111,6 +127,7 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 - `train/loss`, `train/loss_sum`, `train/loss_sp`, `train/loss_grad`
 - `train/cos_sum`, `train/cos_sp`, `train/mse_sum`, `train/mse_sp`
 - `train/mse_sp_w`, `train/grad_w`, `train/aug_p` (current ramp values)
+- `train/cons_summary`, `train/cons_spatial`, `train/loss_consistency` (consistency loss terms)
 
 ### Train images (every `logging.log_every * logging.image_log_multiplier` steps)
 - `train/teacher_input`: grid of un-augmented inputs (`logging.image_grid.n` images, `logging.image_grid.nrow` per row)

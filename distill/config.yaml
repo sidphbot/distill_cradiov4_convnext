@@ -48,6 +48,8 @@ loss:
   lambda_summary: 1.0
   lambda_spatial: 1.0
   lambda_mse: 0.25
+  lambda_consistency_summary: 0.5
+  lambda_consistency_spatial: 0.5
   grad_eps: 1.0e-3
   ramp:
     mse_sp_w: { start: 0.5, end: 1.5, warmup_frac: 0.2 }
