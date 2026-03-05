@@ -1,7 +1,8 @@
 import hashlib
 import io
+import os
 import random
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torchvision.transforms.functional as TF
@@ -15,37 +16,28 @@ import pytorch_lightning as pl
 # DATA
 # ============================================================
 
-def _stable_hash01(s: str) -> float:
-    h = hashlib.md5(s.encode("utf-8")).hexdigest()
-    x = int(h[:8], 16) / 0xFFFFFFFF
-    return float(x)
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 
 
 def _stable_hash_int(s: str) -> int:
     return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
 
 
-def read_image_list(list_file: str) -> List[str]:
-    paths = []
-    with open(list_file, "r", encoding="utf-8") as f:
-        for ln in f:
-            s = ln.strip()
-            if not s or s.startswith("#"):
-                continue
-            paths.append(s)
-    if not paths:
-        raise RuntimeError(f"No image paths found in {list_file}")
+def _stable_hash01(s: str) -> float:
+    """Return a deterministic float in [0, 1) for a string key."""
+    return _stable_hash_int(s) / 0x1_0000_0000
+
+
+def _collect_images(directory: str) -> List[str]:
+    """Recursively collect image paths from a directory."""
+    root = os.path.abspath(directory)
+    paths = sorted(
+        os.path.join(dp, f)
+        for dp, _, fnames in os.walk(root)
+        for f in fnames
+        if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+    )
     return paths
-
-
-def split_paths_deterministic(paths: List[str], val_frac: float, seed: int) -> Tuple[List[str], List[str]]:
-    train, val = [], []
-    for p in paths:
-        x = _stable_hash01(f"{seed}:{p}")
-        (val if x < val_frac else train).append(p)
-    if not train or not val:
-        raise RuntimeError(f"Split produced empty train/val (val_frac={val_frac}).")
-    return train, val
 
 
 class ImagePathDataset(Dataset):
@@ -133,23 +125,67 @@ class DistillDataModule(pl.LightningDataModule):
         super().__init__()
         self.cfg = cfg
         self.train_ds = None
-        self.val_ds = None
+        self.val_datasets: Dict[str, ImagePathDataset] = {}
+        self.val_source_names: List[str] = []
 
     def setup(self, stage=None):
-        all_paths = read_image_list(self.cfg.data.data_list)
-        train_paths, val_paths = split_paths_deterministic(
-            all_paths, val_frac=self.cfg.data.val_frac, seed=self.cfg.seed,
+        val_frac = getattr(self.cfg.data, "val_frac", 0.02)
+        val_cap = getattr(self.cfg.data, "val_cap", 0)
+
+        # --- OI: split image_dir into train + oi_val ---
+        all_oi = _collect_images(self.cfg.data.image_dir)
+        if not all_oi:
+            raise RuntimeError(f"No images found in image_dir: {self.cfg.data.image_dir}")
+
+        oi_train = []
+        oi_val = []
+        for p in all_oi:
+            if _stable_hash01(p) < val_frac:
+                oi_val.append(p)
+            else:
+                oi_train.append(p)
+
+        if not oi_val:
+            raise RuntimeError(
+                f"val_frac={val_frac} produced 0 val images from {len(all_oi)} total. Increase val_frac."
+            )
+
+        # Apply caps
+        train_cap = getattr(self.cfg.data, "train_cap", 0)
+        if train_cap > 0:
+            oi_train = oi_train[:train_cap]
+        if val_cap > 0:
+            oi_val = oi_val[:val_cap]
+
+        self.train_ds = ImagePathDataset(oi_train)
+
+        # Build ordered val datasets: oi_val first, then config val_sources
+        self.val_datasets = {}
+        self.val_source_names = []
+
+        self.val_datasets["oi_val"] = ImagePathDataset(oi_val)
+        self.val_source_names.append("oi_val")
+
+        # --- Off-distribution val sources ---
+        val_sources = getattr(self.cfg.data, "val_sources", {}) or {}
+        for name, directory in val_sources.items():
+            if not directory:
+                continue
+            vp = _collect_images(directory)
+            if not vp:
+                print(f"[WARN] No images found in val source '{name}': {directory}")
+                continue
+            if val_cap > 0:
+                vp = vp[:val_cap]
+            self.val_datasets[name] = ImagePathDataset(vp)
+            self.val_source_names.append(name)
+
+        # Summary
+        parts = [f"{name}={len(ds)}" for name, ds in self.val_datasets.items()]
+        print(
+            f"[DATA] train={len(self.train_ds)} (OI, val_frac={val_frac}) "
+            f"val: {', '.join(parts)}"
         )
-
-        if getattr(self.cfg.data, "train_cap", 0) > 0:
-            train_paths = train_paths[:self.cfg.data.train_cap]
-        if getattr(self.cfg.data, "val_cap", 0) > 0:
-            val_paths = val_paths[:self.cfg.data.val_cap]
-
-        print(f"[{self.cfg.mode.upper()}][ONLINE] train={len(train_paths)} val={len(val_paths)}")
-
-        self.train_ds = ImagePathDataset(train_paths)
-        self.val_ds = ImagePathDataset(val_paths)
 
     def train_dataloader(self):
         collate = OnlineCollate(self.train_ds, size=self.cfg.data.size)
@@ -165,14 +201,19 @@ class DistillDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
-        collate = OnlineCollate(self.val_ds, size=self.cfg.data.size)
-        return DataLoader(
-            self.val_ds,
-            batch_size=self.cfg.dataloader.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.dataloader.num_workers,
-            pin_memory=True,
-            collate_fn=collate,
-            persistent_workers=self.cfg.dataloader.persistent_workers and self.cfg.dataloader.num_workers > 0,
-            prefetch_factor=self.cfg.dataloader.prefetch_factor if self.cfg.dataloader.num_workers > 0 else None,
-        )
+        """Return a list of DataLoaders — one per val source, in val_source_names order."""
+        loaders = []
+        for name in self.val_source_names:
+            ds = self.val_datasets[name]
+            collate = OnlineCollate(ds, size=self.cfg.data.size)
+            loaders.append(DataLoader(
+                ds,
+                batch_size=self.cfg.dataloader.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.dataloader.num_workers,
+                pin_memory=True,
+                collate_fn=collate,
+                persistent_workers=self.cfg.dataloader.persistent_workers and self.cfg.dataloader.num_workers > 0,
+                prefetch_factor=self.cfg.dataloader.prefetch_factor if self.cfg.dataloader.num_workers > 0 else None,
+            ))
+        return loaders

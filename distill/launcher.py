@@ -1,5 +1,4 @@
 import argparse
-import os
 import time
 from pathlib import Path
 
@@ -17,27 +16,6 @@ from distill.model import (
     build_param_groups, teacher_forward_fixed,
 )
 from distill.lightning_module import DistillLightningModule
-
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
-
-
-def _generate_data_list(image_dir: str) -> str:
-    """Walk image_dir, write paths to ./data_list.txt, return its path."""
-    root = os.path.abspath(image_dir)
-    paths = sorted(
-        os.path.join(dp, f)
-        for dp, _, fnames in os.walk(root)
-        for f in fnames
-        if os.path.splitext(f)[1].lower() in IMAGE_EXTS
-    )
-    if not paths:
-        raise SystemExit(f"No images found in {root}")
-    out = os.path.join(os.getcwd(), "data_list.txt")
-    with open(out, "w") as fh:
-        fh.write("\n".join(paths) + "\n")
-    print(f"Generated {out} with {len(paths)} images from {root}")
-    return out
 
 
 def load_config():
@@ -65,14 +43,6 @@ def load_config():
             cfg = OmegaConf.merge(cfg, debug_overlay)
         suffix = cfg.experiment.get("suffix", "")
         cfg.experiment.suffix = f"{suffix}_debug" if suffix else "debug"
-
-    # Handle image_dir -> data_list generation
-    image_dir = cfg.data.get("image_dir", "")
-    if image_dir and not cfg.data.data_list:
-        cfg.data.data_list = _generate_data_list(image_dir)
-        cfg.data.image_dir = ""
-    elif image_dir and cfg.data.data_list:
-        raise SystemExit("Provide data.data_list or data.image_dir, not both.")
 
     return cfg
 
@@ -109,8 +79,11 @@ def build_model(cfg, device, Ct, Dt, Ht, Wt, student_name):
 def main():
     cfg = load_config()
 
-    if not cfg.data.data_list:
-        raise SystemExit("data.data_list or data.image_dir is required")
+    if not cfg.data.image_dir:
+        raise SystemExit("data.image_dir is required")
+    val_frac = getattr(cfg.data, "val_frac", 0.0)
+    if val_frac <= 0:
+        raise SystemExit("data.val_frac must be > 0 (fraction of image_dir held out for oi_val)")
 
     torch.manual_seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -174,6 +147,7 @@ def main():
         steps_per_epoch=steps_per_epoch,
     )
     lit_module.checkpoint_dir = Path(cfg.experiment.root) / exp_name / "checkpoints"
+    lit_module.set_val_source_names(dm.val_source_names)
 
     # 7. Logger & Trainer
     tb_logger = TensorBoardLogger(

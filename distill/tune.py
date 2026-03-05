@@ -26,7 +26,7 @@ from transformers import AutoModel, CLIPImageProcessor
 from distill.data import DistillDataModule
 from distill.model import teacher_forward_fixed
 from distill.lightning_module import DistillLightningModule
-from distill.launcher import build_model, _generate_data_list
+from distill.launcher import build_model
 
 
 class OptunaCallback(pl.Callback):
@@ -143,6 +143,7 @@ def objective(trial, base_cfg, tune_cfg):
         steps_per_epoch=steps_per_epoch,
     )
     lit_module.checkpoint_dir = Path(cfg.experiment.root) / "optuna" / trial_name / "checkpoints"
+    lit_module.set_val_source_names(dm.val_source_names)
 
     tb_logger = TensorBoardLogger(
         save_dir=str(Path(cfg.experiment.root) / "optuna" / trial_name),
@@ -185,16 +186,11 @@ def main():
         cli_cfg = OmegaConf.from_dotlist(overrides)
         base_cfg = OmegaConf.merge(base_cfg, cli_cfg)
 
-    # Handle image_dir -> data_list generation (same as launcher)
-    image_dir = base_cfg.data.get("image_dir", "")
-    if image_dir and not base_cfg.data.data_list:
-        base_cfg.data.data_list = _generate_data_list(image_dir)
-        base_cfg.data.image_dir = ""
-    elif image_dir and base_cfg.data.data_list:
-        raise SystemExit("Provide data.data_list or data.image_dir, not both.")
-
-    if not base_cfg.data.data_list:
-        raise SystemExit("data.data_list or data.image_dir is required")
+    if not base_cfg.data.image_dir:
+        raise SystemExit("data.image_dir is required")
+    val_frac = getattr(base_cfg.data, "val_frac", 0.0)
+    if val_frac <= 0:
+        raise SystemExit("data.val_frac must be > 0 (fraction of image_dir held out for oi_val)")
 
     # Load tune config
     tune_cfg = OmegaConf.load(args.tune_config)

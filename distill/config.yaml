@@ -16,13 +16,15 @@ teacher:
   amp: true
 
 data:
-  data_list: ""
-  image_dir: ""
-  val_frac: 0.02
+  image_dir: ""           # training images directory
+  val_frac: 0.02          # fraction of image_dir held out as oi_val
+  val_sources:            # named off-distribution val directories
+    coco_train: ""
+    imagenet_train: ""
   size: 416
   patch_size: 16
   train_cap: 0
-  val_cap: 0
+  val_cap: 0              # applied per source
   normalize:
     mean: [0.485, 0.456, 0.406]
     std:  [0.229, 0.224, 0.225]

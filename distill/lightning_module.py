@@ -41,6 +41,18 @@ def _normalize_batch(x: torch.Tensor, mean, std) -> torch.Tensor:
     return x.sub_(m).div_(s)
 
 
+def _empty_accumulator():
+    """Return a fresh per-source accumulator dict."""
+    return {
+        "agg": {},
+        "n": 0,
+        "summary_cos": [],
+        "spatial_cos": [],
+        "edge_corr": [],
+        "scalar_sums": {},
+    }
+
+
 class DistillLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -86,17 +98,21 @@ class DistillLightningModule(pl.LightningModule):
         self._scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.amp)
         self._micro_step = 0
 
-        # Eval accumulators
-        self._val_agg = {}
-        self._val_n = 0
-        self._val_summary_cos = []
-        self._val_spatial_cos = []
-        self._val_edge_corr = []
-        self._val_scalar_sums = {}
+        # Per-source val accumulators (initialized by set_val_source_names)
+        self._val_source_names: list[str] = []
+        self._val_per_source: dict[str, dict] = {}
         self._last_alignment_score = 0.0
 
         self._steps_per_epoch = steps_per_epoch
         self._cached_opt = None
+
+    def set_val_source_names(self, names: list[str]):
+        """Called after dm.setup() to configure per-source accumulators."""
+        self._val_source_names = list(names)
+        self._reset_val_accumulators()
+
+    def _reset_val_accumulators(self):
+        self._val_per_source = {src: _empty_accumulator() for src in self._val_source_names}
 
     def forward(self, x):
         return self.model(x)
@@ -254,7 +270,13 @@ class DistillLightningModule(pl.LightningModule):
             print(f"[MEM] step={step} allocated={alloc:.0f}MB reserved={resv:.0f}MB")
 
     @torch.no_grad()
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        src = self._val_source_names[dataloader_idx] if self._val_source_names else "val"
+        acc = self._val_per_source.get(src)
+        if acc is None:
+            acc = _empty_accumulator()
+            self._val_per_source[src] = acc
+
         img_u8, pil_rs, keys = batch
         device = self.device
 
@@ -286,13 +308,13 @@ class DistillLightningModule(pl.LightningModule):
             )
 
         # Accumulate losses as floats
-        if not self._val_agg:
-            self._val_agg = {k: 0.0 for k in out}
+        if not acc["agg"]:
+            acc["agg"] = {k: 0.0 for k in out}
         for k in out:
-            self._val_agg[k] += out[k].item()
+            acc["agg"][k] += out[k].item()
         del out
 
-        # Spatial compare logs for first few batches (uses GPU tensors, do before moving to CPU)
+        # Spatial compare logs for first few batches
         vsc = self.cfg.logging.val_spatial_compare
         if batch_idx % vsc.batch_mod == 0 and batch_idx < vsc.max_batches:
             tb = self.logger.experiment
@@ -303,7 +325,7 @@ class DistillLightningModule(pl.LightningModule):
                 t_tokens_btd=t_spatial_tokens,
                 Ht=self.Ht,
                 Wt=self.Wt,
-                tag_prefix=f"eval/spatial_compare_{batch_idx}_first",
+                tag_prefix=f"eval/{src}/spatial_compare_{batch_idx}_first",
                 max_side=vsc.max_side,
             )
 
@@ -316,7 +338,7 @@ class DistillLightningModule(pl.LightningModule):
         del s_sum, t_summary, s_tokens, s_sp, t_spatial_tokens, x
         torch.cuda.empty_cache()
 
-        self._val_n += 1
+        acc["n"] += 1
 
         # All diagnostics on CPU
         s_tokens2 = _flatten_spatial_tokens(s_sp_c)        # (B,T,D)
@@ -324,10 +346,10 @@ class DistillLightningModule(pl.LightningModule):
         B, Tt, Dt_ = t_tokens2.shape
         t_map = t_tokens2.transpose(1, 2).contiguous().reshape(B, Dt_, self.Ht, self.Wt)
 
-        self._val_summary_cos.append(_cosine_sim(s_sum_c, t_summary_c, dim=-1))
-        self._val_spatial_cos.append(_cosine_sim(s_tokens2, t_tokens2, dim=-1).flatten())
+        acc["summary_cos"].append(_cosine_sim(s_sum_c, t_summary_c, dim=-1))
+        acc["spatial_cos"].append(_cosine_sim(s_tokens2, t_tokens2, dim=-1).flatten())
 
-        sums = self._val_scalar_sums
+        sums = acc["scalar_sums"]
         sums["retrieval_top1"] = sums.get("retrieval_top1", 0.0) + float(_batch_retrieval_top1(s_sum_c, t_summary_c))
         sums["retrieval_mrr"] = sums.get("retrieval_mrr", 0.0) + float(_batch_retrieval_mrr(s_sum_c, t_summary_c))
         sums["summary_cka"] = sums.get("summary_cka", 0.0) + float(_centered_kernel_alignment(s_sum_c, t_summary_c))
@@ -361,7 +383,7 @@ class DistillLightningModule(pl.LightningModule):
         del s_energy_map
         g_img_ds = F.interpolate(g_img, size=(self.Ht, self.Wt), mode="bilinear", align_corners=False)
         del g_img
-        self._val_edge_corr.append(_pearson_corr_per_sample(g_feat.flatten(1), g_img_ds.flatten(1)))
+        acc["edge_corr"].append(_pearson_corr_per_sample(g_feat.flatten(1), g_img_ds.flatten(1)))
         del g_feat, g_img_ds
 
         # HF metrics (all CPU)
@@ -381,80 +403,122 @@ class DistillLightningModule(pl.LightningModule):
         # Just defragment GPU — reporting happens in on_train_epoch_end
         torch.cuda.empty_cache()
 
-    def on_train_epoch_end(self):
-        n = self._val_n
+    def _compute_source_metrics(self, src: str, acc: dict) -> dict:
+        """Compute and log all metrics for one val source. Returns key values."""
+        n = acc["n"]
         if n == 0:
-            return
+            return {}
 
         tb = self.logger.experiment
         step = self.global_step
         quantiles = list(self.cfg.logging.quantiles)
 
         # Mean losses
-        val_loss = self._val_agg.get("loss", 0.0) / n
-        for k, v in self._val_agg.items():
-            tb.add_scalar(f"val/{k}", v / n, step)
+        val_loss = acc["agg"].get("loss", 0.0) / n
+        for k, v in acc["agg"].items():
+            tb.add_scalar(f"val/{src}/{k}", v / n, step)
 
         # Quantile metrics
-        if self._val_summary_cos:
-            cat = torch.cat(self._val_summary_cos, dim=0)
-            tb.add_scalar("val/summary_cos_mean", cat.mean().item(), step)
+        if acc["summary_cos"]:
+            cat = torch.cat(acc["summary_cos"], dim=0)
+            tb.add_scalar(f"val/{src}/summary_cos_mean", cat.mean().item(), step)
             for q in quantiles:
-                tb.add_scalar(f"val/summary_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
+                tb.add_scalar(f"val/{src}/summary_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
 
-        if self._val_spatial_cos:
-            cat = torch.cat(self._val_spatial_cos, dim=0)
-            tb.add_scalar("val/spatial_cos_mean", cat.mean().item(), step)
+        if acc["spatial_cos"]:
+            cat = torch.cat(acc["spatial_cos"], dim=0)
+            tb.add_scalar(f"val/{src}/spatial_cos_mean", cat.mean().item(), step)
             for q in quantiles:
-                tb.add_scalar(f"val/spatial_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
+                tb.add_scalar(f"val/{src}/spatial_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
 
-        if self._val_edge_corr:
-            cat = torch.cat(self._val_edge_corr, dim=0)
-            tb.add_scalar("val/edge_align_corr_mean", cat.mean().item(), step)
+        if acc["edge_corr"]:
+            cat = torch.cat(acc["edge_corr"], dim=0)
+            tb.add_scalar(f"val/{src}/edge_align_corr_mean", cat.mean().item(), step)
             for q in quantiles:
-                tb.add_scalar(f"val/edge_align_corr_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
+                tb.add_scalar(f"val/{src}/edge_align_corr_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
 
         # Scalar means
-        for k, v in self._val_scalar_sums.items():
-            tb.add_scalar(f"val/{k}", v / n, step)
+        for k, v in acc["scalar_sums"].items():
+            tb.add_scalar(f"val/{src}/{k}", v / n, step)
 
-        # Composite alignment score (all terms: higher = better)
-        # cos_sum/cos_sp are losses (1 - cos_sim), so invert them
-        cos_sum_sim = 1.0 - self._val_agg.get("cos_sum", 0.0) / n
-        cos_sp_sim  = 1.0 - self._val_agg.get("cos_sp", 0.0) / n
-        hf_cos_mean = self._val_scalar_sums.get("hf_cos", 0.0) / n
-        hf_mse_mean = self._val_scalar_sums.get("hf_mse", 0.0) / n
-        act_f1_mean = self._val_scalar_sums.get("act_f1", 0.0) / n
+        # Composite alignment score
+        cos_sum_sim = 1.0 - acc["agg"].get("cos_sum", 0.0) / n
+        cos_sp_sim  = 1.0 - acc["agg"].get("cos_sp", 0.0) / n
+        hf_cos_mean = acc["scalar_sums"].get("hf_cos", 0.0) / n
+        hf_mse_mean = acc["scalar_sums"].get("hf_mse", 0.0) / n
+        act_f1_mean = acc["scalar_sums"].get("act_f1", 0.0) / n
 
         alignment_score = (
             0.30 * cos_sum_sim + 0.30 * cos_sp_sim
             + 0.20 * hf_cos_mean - 0.10 * hf_mse_mean
             + 0.30 * act_f1_mean
         )
-        tb.add_scalar("val/act_f1", act_f1_mean, step)
-        tb.add_scalar("val/alignment_score", alignment_score, step)
-        self._last_alignment_score = alignment_score
+        tb.add_scalar(f"val/{src}/act_f1", act_f1_mean, step)
+        tb.add_scalar(f"val/{src}/alignment_score", alignment_score, step)
 
-        # Checkpointing on val improvement
-        if self.best_val_loss is None or val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            self._save_checkpoint(step, val_loss)
+        return {"alignment_score": alignment_score, "val_loss": val_loss}
+
+    def on_train_epoch_end(self):
+        # Check if any source has data
+        total_n = sum(acc["n"] for acc in self._val_per_source.values())
+        if total_n == 0:
+            return
+
+        tb = self.logger.experiment
+        step = self.global_step
+
+        # Compute per-source metrics
+        source_results = {}
+        for src in self._val_source_names:
+            acc = self._val_per_source.get(src)
+            if acc and acc["n"] > 0:
+                source_results[src] = self._compute_source_metrics(src, acc)
+
+        # Group-level alignment scores
+        oi_score = source_results.get("oi_val", {}).get("alignment_score", 0.0)
+        off_dist_sources = [name for name in self._val_source_names if name != "oi_val"]
+        off_dist_scores = [source_results[s]["alignment_score"] for s in off_dist_sources if s in source_results]
+
+        if off_dist_scores:
+            off_dist_avg = sum(off_dist_scores) / len(off_dist_scores)
+        else:
+            off_dist_avg = 0.0
+
+        tb.add_scalar("val/in_dist/alignment_score", oi_score, step)
+        tb.add_scalar("val/off_dist/alignment_score", off_dist_avg, step)
+
+        # Overall: 0.25 × oi_val + 0.375 × coco_train + 0.375 × imagenet_train
+        # Generalized: 0.25 × oi_val + 0.75 spread across off-dist sources
+        if off_dist_scores:
+            off_weight_each = 0.75 / len(off_dist_scores)
+            overall = 0.25 * oi_score + sum(off_weight_each * s for s in off_dist_scores)
+        else:
+            overall = oi_score
+
+        tb.add_scalar("val/alignment_score", overall, step)
+        self._last_alignment_score = overall
+
+        # Checkpointing on val improvement (use oi_val loss as primary)
+        oi_loss = source_results.get("oi_val", {}).get("val_loss")
+        if oi_loss is not None:
+            if self.best_val_loss is None or oi_loss < self.best_val_loss:
+                self.best_val_loss = oi_loss
+                self._save_checkpoint(step, oi_loss)
 
         # Print epoch summary
+        parts = []
+        for src in self._val_source_names:
+            r = source_results.get(src, {})
+            parts.append(f"{src}: loss={r.get('val_loss', 0):.4f} align={r.get('alignment_score', 0):.4f}")
+        n_batches = {src: self._val_per_source[src]["n"] for src in self._val_source_names}
         print(
-            f"[VAL] epoch={self.current_epoch} step={step} loss={val_loss:.4f} "
-            f"loss_sum={self._val_agg.get('loss_sum', 0) / n:.4f} "
-            f"loss_sp={self._val_agg.get('loss_sp', 0) / n:.4f} "
-            f"(aggregated over {n} val batches)"
+            f"[VAL] epoch={self.current_epoch} step={step} overall_align={overall:.4f} "
+            f"| {' | '.join(parts)} "
+            f"(batches: {n_batches})"
         )
 
         # Reset accumulators for next epoch
-        self._val_agg = {}
-        self._val_n = 0
-        self._val_summary_cos = []
-        self._val_spatial_cos = []
-        self._val_edge_corr = []
-        self._val_scalar_sums = {}
+        self._reset_val_accumulators()
 
     def on_train_epoch_start(self):
         # Update dataset seed for pad-vs-squash variation
