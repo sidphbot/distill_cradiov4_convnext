@@ -97,21 +97,6 @@ Match your distill loader:
 * decode \-\> float \-\> resize bicubic antialias \-\> normalize ImageNet mean/std  
    data
 
-### **Teacher preprocessing**
-
-Match your caching logic:
-
-* manually resize PIL to `(size,size)`  
-* then call processor with `do_resize=False`, `do_center_crop=False`  
-   cache\_teacher\_outputs
-
-Create `bench/common/preprocess.py` with:
-
-* `preprocess_student_tensor(img_u8)->tensor`  
-* `preprocess_teacher_pil(pil)->pil_resized`  
-* keep size configurable (`--size`, default 416\)
-
----
 
 ## **5\) Model adapters**
 
@@ -402,7 +387,3 @@ python \-m bench.reports.summarize\_runs \\
  \--runs\_root /exp/bench \\  
  \--out\_csv /exp/bench/summary.csv \\  
  \--out\_md /exp/bench/summary.md
-
-## **11\) What is downloaded already:**
-
-Downloaded dataset: the images from imagenet and coco are saved in the usual longest size resized to 416, jpg format in a certain directory each for each dataset. check the scripts /home/burplord/distill\_cradiov4/download\_imagenet\_hf.py and /home/burplord/distill\_cradiov4/download\_coco.py to check how they were downloaded and also include 1-2 annotation download and association scripts to associate those images. These are what we will be using for the bechmarking.
