@@ -103,8 +103,45 @@ def _sample_search_space(trial, search_space):
     return sampled
 
 
+def _teardown_dataloaders(trainer):
+    """Explicitly shutdown dataloader workers to prevent zombie processes."""
+    for attr in ("train_dataloader", "val_dataloaders"):
+        obj = getattr(trainer, attr, None)
+        if obj is None:
+            continue
+        # Lightning may wrap in a list or CombinedLoader
+        loaders = obj if isinstance(obj, (list, tuple)) else [obj]
+        for loader in loaders:
+            if hasattr(loader, "_iterator") and loader._iterator is not None:
+                try:
+                    loader._iterator._shutdown_workers()
+                except Exception:
+                    pass
+
+
+# Cache the data module across trials — no need to re-scan image dirs each time.
+# The dataset is read-only and config caps are applied once.
+_dm_cache = {}
+
+
+def _get_data_module(cfg):
+    """Build and cache DistillDataModule. Reuses across trials with same caps."""
+    cache_key = (
+        cfg.data.image_dir,
+        getattr(cfg.data, "train_cap", 0),
+        getattr(cfg.data, "val_cap", 0),
+    )
+    if cache_key not in _dm_cache:
+        dm = DistillDataModule(cfg)
+        dm.setup()
+        _dm_cache[cache_key] = dm
+    return _dm_cache[cache_key]
+
+
 def objective(trial, base_cfg, tune_cfg):
     """Single Optuna trial: sample HPs, train for a few epochs, return alignment_score."""
+    import gc
+
     cfg = copy.deepcopy(base_cfg)
 
     # 1. Apply trial_overrides from tune config (data caps, epochs, etc.)
@@ -116,15 +153,20 @@ def objective(trial, base_cfg, tune_cfg):
     for dotpath, value in sampled.items():
         OmegaConf.update(cfg, dotpath, value)
 
+    # Disable persistent workers in tuning to prevent zombie processes.
+    # Each trial creates new DataLoaders; persistent workers from the
+    # previous trial's loaders would linger as zombies since the old
+    # Trainer/DataLoader refs are deleted between trials.
+    cfg.dataloader.persistent_workers = False
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 3. Load teacher (cached across trials)
     teacher, teacher_proc = _get_teacher(cfg, device)
     Ct, Dt, Ht, Wt = _infer_teacher_dims(teacher, teacher_proc, cfg, device)
 
-    # 4. Build data module
-    dm = DistillDataModule(cfg)
-    dm.setup()
+    # 4. Build data module (cached across trials — avoids re-scanning image dirs)
+    dm = _get_data_module(cfg)
 
     # 5. Build student model (fresh each trial)
     student_name = cfg.model.student_models[cfg.model.student_variant]
@@ -165,8 +207,10 @@ def objective(trial, base_cfg, tune_cfg):
 
     score = lit_module._last_alignment_score
 
-    # 8. Cleanup GPU memory
+    # 8. Cleanup: shut down dataloader workers, free GPU memory, run GC
+    _teardown_dataloaders(trainer)
     del model, lit_module, trainer
+    gc.collect()
     torch.cuda.empty_cache()
 
     return score
