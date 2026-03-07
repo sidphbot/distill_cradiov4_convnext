@@ -174,6 +174,8 @@ def objective(trial, base_cfg, tune_cfg):
 
     steps_per_epoch = math.ceil(len(dm.train_ds) / cfg.dataloader.batch_size)
 
+    study_name = tune_cfg.study.name
+
     # 6. Create Lightning module
     trial_name = f"trial_{trial.number}_{time.strftime('%Y%m%d%H%M%S')}"
     lit_module = DistillLightningModule(
@@ -184,11 +186,11 @@ def objective(trial, base_cfg, tune_cfg):
         Ct=Ct, Dt=Dt, Ht=Ht, Wt=Wt,
         steps_per_epoch=steps_per_epoch,
     )
-    lit_module.checkpoint_dir = Path(cfg.experiment.root) / "optuna" / trial_name / "checkpoints"
+    lit_module.checkpoint_dir = Path(cfg.experiment.root) / "optuna" / study_name / trial_name / "checkpoints"
     lit_module.set_val_source_names(dm.val_source_names)
 
     tb_logger = TensorBoardLogger(
-        save_dir=str(Path(cfg.experiment.root) / "optuna" / trial_name),
+        save_dir=str(Path(cfg.experiment.root) / "optuna" / study_name / trial_name),
         name="tb",
     )
 
