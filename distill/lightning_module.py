@@ -8,6 +8,7 @@ import pytorch_lightning as pl
 from torchvision.utils import make_grid
 
 from distill.augment import apply_student_augmentations, build_augmentation_pipeline
+from distill.muon import build_adamw_muon_optimizer
 from distill.model import (
     DistillModel,
     LossWeights,
@@ -86,6 +87,30 @@ class DistillLightningModule(pl.LightningModule):
             lambda_mse=cfg.loss.lambda_mse,
         )
 
+        # Mutable loss_state dict for hotcb live control
+        self.loss_state = {
+            "weights": {
+                "lambda_summary": cfg.loss.lambda_summary,
+                "lambda_spatial": cfg.loss.lambda_spatial,
+                "lambda_mse": cfg.loss.lambda_mse,
+                "ramp_mse_sp_end": cfg.loss.ramp.mse_sp.end,
+                "ramp_grad_end": cfg.loss.ramp.grad.end,
+                "ramp_cons_summary_end": cfg.loss.ramp.cons_summary.end,
+                "ramp_cons_spatial_end": cfg.loss.ramp.cons_spatial.end,
+                "aug_strength_end": cfg.augmentation.strength_end,
+            },
+            "terms": {
+                "lambda_summary": True,
+                "lambda_spatial": True,
+                "lambda_mse": True,
+                "ramp_mse_sp_end": True,
+                "ramp_grad_end": True,
+                "ramp_cons_summary_end": True,
+                "ramp_cons_spatial_end": True,
+                "aug_strength_end": True,
+            },
+        }
+
         self.best_val_loss = None
 
         self.checkpoint_dir = Path(cfg.experiment.root) / "checkpoints"
@@ -121,8 +146,13 @@ class DistillLightningModule(pl.LightningModule):
         img_u8, pil_rs, keys = batch
         device = self.device
         if self._cached_opt is None:
-            self._cached_opt = self.optimizers()
-        opt = self._cached_opt
+            opt_result = self.optimizers()
+            # Normalize to list for uniform handling (single AdamW or [AdamW, Muon])
+            if isinstance(opt_result, (list, tuple)):
+                self._cached_opt = list(opt_result)
+            else:
+                self._cached_opt = [opt_result]
+        opts = self._cached_opt
 
         # 1. Teacher forward (no grad)
         t_summary, t_spatial_tokens = teacher_forward_fixed(
@@ -139,18 +169,24 @@ class DistillLightningModule(pl.LightningModule):
         torch.cuda.empty_cache()
 
         # 2. Ramp loss weights (warmup_frac is fraction of first epoch)
+        #    Read live-adjustable endpoints from loss_state (hotcb can modify these)
+        ws = self.loss_state["weights"]
+        self.loss_w.lambda_summary = ws["lambda_summary"]
+        self.loss_w.lambda_spatial = ws["lambda_spatial"]
+        self.loss_w.lambda_mse = ws["lambda_mse"]
+
         spe = self._steps_per_epoch
         self.loss_w.lambda_sp_mse = ramp_linear(
             step=self.global_step,
             warmup_steps=int(self.cfg.loss.ramp.mse_sp.warmup_frac * spe),
             start=self.cfg.loss.ramp.mse_sp.start,
-            end=self.cfg.loss.ramp.mse_sp.end,
+            end=ws["ramp_mse_sp_end"],
         )
         self.loss_w.lambda_grad = ramp_linear(
             step=self.global_step,
             warmup_steps=int(self.cfg.loss.ramp.grad.warmup_frac * spe),
             start=self.cfg.loss.ramp.grad.start,
-            end=self.cfg.loss.ramp.grad.end,
+            end=ws["ramp_grad_end"],
         )
 
         # 3. Prepare clean and augmented inputs on CPU
@@ -158,7 +194,7 @@ class DistillLightningModule(pl.LightningModule):
             self.global_step,
             int(self.cfg.augmentation.warmup_frac * spe),
             self.cfg.augmentation.strength_start,
-            self.cfg.augmentation.strength_end,
+            ws["aug_strength_end"],
         )
 
         # Periodically log image grids (before we consume img_u8)
@@ -194,13 +230,13 @@ class DistillLightningModule(pl.LightningModule):
             step=self.global_step,
             warmup_steps=int(self.cfg.loss.ramp.cons_summary.warmup_frac * spe),
             start=self.cfg.loss.ramp.cons_summary.start,
-            end=self.cfg.loss.ramp.cons_summary.end,
+            end=ws["ramp_cons_summary_end"],
         )
         lambda_csp = ramp_linear(
             step=self.global_step,
             warmup_steps=int(self.cfg.loss.ramp.cons_spatial.warmup_frac * spe),
             start=self.cfg.loss.ramp.cons_spatial.start,
-            end=self.cfg.loss.ramp.cons_spatial.end,
+            end=ws["ramp_cons_spatial_end"],
         )
 
         # --- Phase A: clean forward → distill loss → backward (frees clean graph) ---
@@ -250,18 +286,33 @@ class DistillLightningModule(pl.LightningModule):
 
         # 8. Optimizer step every grad_accum micro-steps
         if self._micro_step >= self._grad_accum:
-            self._scaler.unscale_(opt)
+            for opt in opts:
+                self._scaler.unscale_(opt)
+            # Compute grad norm before clipping (after unscale, before step)
+            grad_norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    grad_norm += p.grad.data.float().norm().item() ** 2
+            log_vals["grad_norm"] = grad_norm ** 0.5
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.grad_clip)
-            self._scaler.step(opt)
+            for opt in opts:
+                self._scaler.step(opt)
             self._scaler.update()
-            opt.zero_grad(set_to_none=True)
+            for opt in opts:
+                opt.zero_grad(set_to_none=True)
             self._micro_step = 0
 
-        # 9. Logging — write directly to TB, bypass Lightning's metric accumulation
+        # Log optimizer state
+        log_vals["lr"] = opts[0].param_groups[0]["lr"]
+        log_vals["weight_decay"] = opts[0].param_groups[0].get("weight_decay", 0.0)
+
+        # 10. Logging — write directly to TB, bypass Lightning's metric accumulation
         tb = self.logger.experiment
         step = self.global_step
         for k, v in log_vals.items():
             tb.add_scalar(f"train/{k}", v, step)
+            self.log(f"train_{k}", v)
 
         # Memory tracking
         if step % self.cfg.logging.mem_track_interval == 0 and torch.cuda.is_available():
@@ -498,6 +549,13 @@ class DistillLightningModule(pl.LightningModule):
         tb.add_scalar("val/alignment_score", overall, step)
         self._last_alignment_score = overall
 
+        val_metrics = {"alignment_score": overall, "in_dist_alignment": oi_score, "off_dist_alignment": off_dist_avg}
+        for src, r in source_results.items():
+            for k, v in r.items():
+                val_metrics[f"{src}_{k}"] = v
+        for k, v in val_metrics.items():
+            self.log(f"val_{k}", v)
+
         # Checkpointing on val improvement (use oi_val loss as primary)
         oi_loss = source_results.get("oi_val", {}).get("val_loss")
         if oi_loss is not None:
@@ -529,16 +587,47 @@ class DistillLightningModule(pl.LightningModule):
                 ds.set_epoch(self.current_epoch)
 
     def configure_optimizers(self):
-        params = []
-        params += build_param_groups(self.model.student, self.cfg.training.wd)
-        params += build_param_groups(self.model.sum_head, self.cfg.training.wd)
-        params += build_param_groups(self.model.sp_head, self.cfg.training.wd)
-        betas = tuple(self.cfg.training.optimizer.betas)
-        opt = torch.optim.AdamW(
-            params, lr=self.cfg.training.lr,
-            betas=betas, eps=self.cfg.training.optimizer.eps,
-        )
-        return opt
+        opt_type = getattr(self.cfg.training, "optimizer_type", "adamw")
+
+        if opt_type == "adamw_muon":
+            # Combined AdamW (norms/biases) + Muon (weight matrices)
+            # Collect all submodules into one namespace for param splitting
+            from itertools import chain
+            all_named = list(chain(
+                self.model.student.named_parameters(),
+                self.model.sum_head.named_parameters(),
+                self.model.sp_head.named_parameters(),
+            ))
+            # Build a temporary nn.Module-like wrapper so build_adamw_muon_optimizer works
+            combined = torch.nn.Module()
+            for i, (name, p) in enumerate(all_named):
+                combined.register_parameter(f"p{i}_{name.replace('.', '_')}", p)
+
+            muon_cfg = self.cfg.training.muon
+            optimizers = build_adamw_muon_optimizer(
+                model=combined,
+                lr_adamw=self.cfg.training.lr,
+                lr_muon=muon_cfg.lr,
+                wd=self.cfg.training.wd,
+                betas=tuple(self.cfg.training.optimizer.betas),
+                eps=self.cfg.training.optimizer.eps,
+                muon_momentum=muon_cfg.momentum,
+                muon_nesterov=muon_cfg.nesterov,
+                muon_ns_steps=muon_cfg.ns_steps,
+            )
+            return optimizers
+        else:
+            # Standard AdamW
+            params = []
+            params += build_param_groups(self.model.student, self.cfg.training.wd)
+            params += build_param_groups(self.model.sum_head, self.cfg.training.wd)
+            params += build_param_groups(self.model.sp_head, self.cfg.training.wd)
+            betas = tuple(self.cfg.training.optimizer.betas)
+            opt = torch.optim.AdamW(
+                params, lr=self.cfg.training.lr,
+                betas=betas, eps=self.cfg.training.optimizer.eps,
+            )
+            return opt
 
     def _save_checkpoint(self, step: int, val_loss: float):
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)

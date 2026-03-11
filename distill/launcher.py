@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -13,9 +14,52 @@ from transformers import AutoModel, CLIPImageProcessor
 from distill.data import DistillDataModule
 from distill.model import (
     DistillModel, SummaryHead, SpatialHead,
-    build_param_groups, teacher_forward_fixed,
+    teacher_forward_fixed,
 )
 from distill.lightning_module import DistillLightningModule
+
+
+def build_hotcb_callback(cfg, run_dir: str):
+    """Build HotCBLightning callback with MetricsCollector.
+
+    Args:
+        cfg: OmegaConf config with hotcb section.
+        run_dir: Experiment directory for hotcb JSONL files.
+
+    Returns:
+        (callback, metrics_collector) tuple, or (None, None) if disabled/unavailable.
+    """
+    if not getattr(cfg, "hotcb", None) or not cfg.hotcb.enabled:
+        return None
+
+    try:
+        from hotcb.kernel import HotKernel
+        from hotcb.adapters.lightning import HotCBLightning
+        from hotcb.metrics import MetricsCollector
+    except ImportError:
+        print("[hotcb] hotcb not installed — skipping integration. "
+              "Install with: pip install 'hotcb[dashboard]'")
+        return None
+
+    os.makedirs(run_dir, exist_ok=True)
+
+    metrics_path = os.path.join(run_dir, "hotcb.metrics.jsonl")
+    mc = MetricsCollector(metrics_path)
+    kernel = HotKernel(
+        run_dir=run_dir,
+        metrics_collector=mc,
+        debounce_steps=cfg.hotcb.get("debounce_steps", 10),
+    )
+
+    callback = HotCBLightning(kernel)
+    key_metric = cfg.hotcb.get("key_metric", "alignment_score")
+    print(f"[hotcb] Enabled — run_dir={run_dir}")
+    print(f"[hotcb] Launch dashboard: hotcb serve --dir {run_dir}")
+    print(f"[hotcb] With autopilot:   hotcb serve --dir {run_dir} "
+          f"--autopilot ai_suggest --key-metric {key_metric}")
+
+    return callback
+
 
 
 def load_config():
@@ -100,6 +144,7 @@ def main():
     dm.setup()
 
     # 3. Infer teacher dims from one forward pass
+    print("Inferring teacher dims...")
     sample_batch = next(iter(dm.train_dataloader()))
     _, pil_rs0, _ = sample_batch
     t_sum0, t_tok0 = teacher_forward_fixed(
@@ -150,10 +195,16 @@ def main():
     lit_module.set_val_source_names(dm.val_source_names)
 
     # 7. Logger & Trainer
+    exp_dir = str(Path(cfg.experiment.root) / exp_name)
     tb_logger = TensorBoardLogger(
-        save_dir=str(Path(cfg.experiment.root) / exp_name),
+        save_dir=exp_dir,
         name="tb",
     )
+
+    callbacks = []
+    hotcb_cb = build_hotcb_callback(cfg, run_dir=exp_dir)
+    if hotcb_cb is not None:
+        callbacks.append(hotcb_cb)
 
     trainer = pl.Trainer(
         max_epochs=cfg.training.epochs,
@@ -162,6 +213,7 @@ def main():
         limit_val_batches=cfg.logging.eval_batches,
         log_every_n_steps=cfg.logging.log_every,
         enable_progress_bar=True,
+        callbacks=callbacks,
     )
 
     # 8. Train

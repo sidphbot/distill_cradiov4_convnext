@@ -9,6 +9,9 @@ lightning_logs/
 *.log
 *.txt
 *.db
+hotcb.*.jsonl
+hotcb.*.json
+runs/
 _download_tmp/
 ./download_coco.py
 ./download_imagenet_hf.py

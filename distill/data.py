@@ -41,17 +41,18 @@ def _collect_images(directory: str) -> List[str]:
 
 
 class ImagePathDataset(Dataset):
-    def __init__(self, paths: List[str]):
+    def __init__(self, paths: List[str], n: int = None):
         self.paths = list(paths)
         self.seed = 0
+        self.n = n
 
     def set_epoch(self, epoch: int):
-        self.seed = int(epoch)
+        self.seed = int(epoch)*random.randint(0, 5000)
         rng = random.Random(self.seed)
         rng.shuffle(self.paths)
 
     def __len__(self):
-        return len(self.paths)
+        return len(self.paths) if self.n is None else self.n
 
     def __getitem__(self, idx: int):
         return self.paths[idx]
@@ -152,18 +153,13 @@ class DistillDataModule(pl.LightningDataModule):
 
         # Apply caps
         train_cap = getattr(self.cfg.data, "train_cap", 0)
-        if train_cap > 0:
-            oi_train = oi_train[:train_cap]
-        if val_cap > 0:
-            oi_val = oi_val[:val_cap]
-
-        self.train_ds = ImagePathDataset(oi_train)
+        self.train_ds = ImagePathDataset(oi_train, n=train_cap)
 
         # Build ordered val datasets: oi_val first, then config val_sources
         self.val_datasets = {}
         self.val_source_names = []
 
-        self.val_datasets["oi_val"] = ImagePathDataset(oi_val)
+        self.val_datasets["oi_val"] = ImagePathDataset(oi_val, n=val_cap)
         self.val_source_names.append("oi_val")
 
         # --- Off-distribution val sources ---
@@ -175,9 +171,7 @@ class DistillDataModule(pl.LightningDataModule):
             if not vp:
                 print(f"[WARN] No images found in val source '{name}': {directory}")
                 continue
-            if val_cap > 0:
-                vp = vp[:val_cap]
-            self.val_datasets[name] = ImagePathDataset(vp)
+            self.val_datasets[name] = ImagePathDataset(vp, n=val_cap)
             self.val_source_names.append(name)
 
         # Summary
