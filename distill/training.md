@@ -120,12 +120,14 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 
 - Runs every `logging.eval_every * training.grad_accum` training batches.
 - `logging.eval_batches` caps how many val batches per run.
-- `validation_step` is wrapped in `@torch.no_grad()`. Forward + loss on GPU, then everything moved to CPU for diagnostics. GPU freed + `empty_cache()` after each val epoch.
-- **Accumulators persist across all val runs within a training epoch** — results are only reported once in `on_train_epoch_end`.
+- `validation_step` is wrapped in `@torch.no_grad()`. Forward + loss on GPU, then everything moved to CPU for diagnostics. GPU freed + `empty_cache()` after each val run.
+- **Metrics are computed and logged after each validation run** in `on_validation_epoch_end` — accumulators reset after each run so every eval window gets fresh metrics. Checkpointing also happens per-run.
 
 ## Logging
 
-### Train (TensorBoard, every `logging.log_every` steps via Lightning)
+All scalar logging goes through `_log(key, value, step)` which writes to both TensorBoard (`add_scalar`) and Lightning (`self.log` with flat key for hotcb/callbacks). Memory metrics also go through this funnel.
+
+### Train (every `logging.log_every` steps)
 - `train/loss`, `train/loss_sum`, `train/loss_sp` (weighted compound losses)
 - `train/cos_sum`, `train/cos_sp`, `train/mse_sum`, `train/mse_sp`, `train/grad` (raw loss components)
 - `train/cons_summary`, `train/cons_spatial`, `train/loss_cons` (consistency loss terms)
@@ -136,7 +138,7 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 - `train/teacher_input`: grid of un-augmented inputs (`logging.image_grid.n` images, `logging.image_grid.nrow` per row)
 - `train/student_input`: grid of augmented inputs (same layout)
 
-### Val (TensorBoard, once per epoch in `on_train_epoch_end`)
+### Val (TensorBoard + self.log, every `logging.eval_every` steps via `on_validation_epoch_end`)
 - **Losses**: `val/loss`, `val/loss_sum`, `val/loss_sp`, `val/cos_sum`, `val/cos_sp`, `val/mse_sum`, `val/mse_sp`, `val/grad`
 - **Summary diagnostics**: `val/summary_cos_{mean,pXX}`, `val/retrieval_top1`, `val/retrieval_mrr`, `val/summary_linear_cka`, `val/summary_mse_mean`, `val/summary_norm_ratio`, `val/summary_{mean,std}_abs_diff`
 - **Spatial diagnostics**: `val/spatial_cos_{mean,pXX}`, `val/spatial_mse_mean`, `val/spatial_norm_ratio`, `val/spatial_style_gram_mse`, `val/spatial_energy_ratio`, `val/spatial_meanD_corr`
@@ -147,12 +149,11 @@ To change augmentations, edit the `augmentation.pipeline` section in `config.yam
 - Quantile suffixes (pXX) are derived from `logging.quantiles` list (e.g. `[0.05, 0.95]` → p05, p95)
 
 ### Console
-- `[MEM]` prints every `logging.mem_track_interval` steps with allocated/reserved GPU MB
-- `[VAL]` once per epoch: `epoch=E step=S loss=X.XXXX loss_sum=X.XXXX loss_sp=X.XXXX (aggregated over N val batches)`
+- `[VAL]` after each eval run: `step=S overall_align=X.XXXX | source: loss=X.XXXX align=X.XXXX (batches: {...})`
 
 ## Checkpointing
 
-- Once per epoch, only if val loss improved over best.
+- After each eval run, only if val loss improved over best.
 - Saves student, summary head, and spatial head state dicts (not teacher, not optimizer).
 - Path: `{experiment.root}/{exp_name}/checkpoints/epoch_E_step_S_val_loss_X.XXX.pth`
 

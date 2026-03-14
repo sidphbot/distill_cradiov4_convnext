@@ -52,7 +52,7 @@ class ImagePathDataset(Dataset):
         rng.shuffle(self.paths)
 
     def __len__(self):
-        return len(self.paths) if self.n is None else self.n
+        return len(self.paths) if not self.n else self.n
 
     def __getitem__(self, idx: int):
         return self.paths[idx]

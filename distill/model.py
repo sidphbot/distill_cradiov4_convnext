@@ -46,10 +46,14 @@ class SummaryHead(nn.Module):
 class SpatialHead(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
+        # 3x3 conv captures local spatial context (beneficial for dense tasks)
+        self.local_conv = nn.Conv2d(in_dim, in_dim, 3, padding=1, bias=False, groups=1)
+        self.act = nn.GELU()
         self.conv = nn.Conv2d(in_dim, out_dim, 1, bias=False)
         self.ln = nn.LayerNorm(out_dim)
 
     def forward(self, x):
+        x = self.act(self.local_conv(x))  # (B,in_dim,H,W) — local context
         y = self.conv(x)  # (B,Dt,H,W)
         y = y.permute(0, 2, 3, 1)  # (B,H,W,Dt)
         y = self.ln(y)

@@ -17,7 +17,9 @@ Or attach to an already-running training:
 
 import math
 import os
+import shutil
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -55,8 +57,20 @@ def train(run_dir: str, max_steps: int, step_delay: float,
     Uses run_dir for all hotcb JSONL I/O. Config is loaded from the normal
     distill config.yaml (with CLI overrides via DISTILL_CONFIG_OVERRIDES env var).
     """
+    # ── Backup and clean previous run_dir artifacts ─────────────────
+    run_path = Path(run_dir)
+    hotcb_files = ["hotcb.metrics.jsonl", "hotcb.commands.jsonl"]
+    existing = [run_path / f for f in hotcb_files if (run_path / f).exists()]
+    if existing:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bkp_dir = run_path / f"hotcb_bkp_{ts}"
+        bkp_dir.mkdir(parents=True, exist_ok=True)
+        for f in existing:
+            shutil.move(str(f), str(bkp_dir / f.name))
+        print(f"[hotcb train] Backed up {len(existing)} old hotcb files to {bkp_dir}")
+
     # ── Load config ──────────────────────────────────────────────────
-    config_path = os.environ.get("DISTILL_CONFIG", "distill/config.yaml")
+    config_path = os.environ.get("DISTILL_CONFIG", "distill/config_hotcb_train.yaml")
     cfg = OmegaConf.load(config_path)
 
     # Allow dotlist overrides via env var (space-separated)
@@ -122,7 +136,7 @@ def train(run_dir: str, max_steps: int, step_delay: float,
     lit_module.set_val_source_names(dm.val_source_names)
 
     # ── hotcb callback + metrics collector ───────────────────────────
-    hotcb_cb = build_hotcb_callback(cfg, run_dir=run_dir)
+    hotcb_cb = build_hotcb_callback(cfg, run_dir=run_dir, mutable_state=lit_module.mutable_state)
     callbacks = []
     if hotcb_cb is not None:
         callbacks.append(hotcb_cb)

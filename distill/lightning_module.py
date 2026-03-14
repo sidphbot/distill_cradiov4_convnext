@@ -1,5 +1,6 @@
 """PyTorch Lightning module for distillation training."""
 
+import math
 from pathlib import Path
 
 import torch
@@ -71,6 +72,7 @@ class DistillLightningModule(pl.LightningModule):
         self.automatic_optimization = False  # manual opt to match old loop memory profile
         self.cfg = cfg
         self.model = model
+        self._tb = None  # cached TB writer
         # Store teacher WITHOUT registering as a submodule —
         # prevents Lightning from calling .train() on it (must stay eval)
         # and from including its params in state_dict / device management.
@@ -86,9 +88,13 @@ class DistillLightningModule(pl.LightningModule):
             lambda_spatial=cfg.loss.lambda_spatial,
             lambda_mse=cfg.loss.lambda_mse,
         )
+        # Log initial loss balance for autopilot context
+        print(f"[INIT] Loss balance: summary={cfg.loss.lambda_summary} spatial={cfg.loss.lambda_spatial} "
+              f"mse={cfg.loss.lambda_mse} grad_end={cfg.loss.ramp.grad.end}")
 
-        # Mutable loss_state dict for hotcb live control
-        self.loss_state = {
+        # Mutable state dict for hotcb live control (named mutable_state so
+        # the HotCBLightning adapter auto-detects it)
+        self.mutable_state = {
             "weights": {
                 "lambda_summary": cfg.loss.lambda_summary,
                 "lambda_spatial": cfg.loss.lambda_spatial,
@@ -139,6 +145,22 @@ class DistillLightningModule(pl.LightningModule):
     def _reset_val_accumulators(self):
         self._val_per_source = {src: _empty_accumulator() for src in self._val_source_names}
 
+    @property
+    def _tb_writer(self):
+        """Lazy-cached TensorBoard SummaryWriter."""
+        if self._tb is None:
+            self._tb = self.logger.experiment
+        return self._tb
+
+    def _log(self, key: str, value: float, step: int | None = None):
+        """Single funnel for all scalar logging (TB + Lightning self.log)."""
+        if step is None:
+            step = self.global_step
+        self._tb_writer.add_scalar(key, value, step)
+        # self.log expects flat key (no slashes), used by hotcb/callbacks
+        flat_key = key.replace("/", "_")
+        self.log(flat_key, value)
+
     def forward(self, x):
         return self.model(x)
 
@@ -169,8 +191,8 @@ class DistillLightningModule(pl.LightningModule):
         torch.cuda.empty_cache()
 
         # 2. Ramp loss weights (warmup_frac is fraction of first epoch)
-        #    Read live-adjustable endpoints from loss_state (hotcb can modify these)
-        ws = self.loss_state["weights"]
+        #    Read live-adjustable endpoints from mutable_state (hotcb can modify these)
+        ws = self.mutable_state["weights"]
         self.loss_w.lambda_summary = ws["lambda_summary"]
         self.loss_w.lambda_spatial = ws["lambda_spatial"]
         self.loss_w.lambda_mse = ws["lambda_mse"]
@@ -277,6 +299,12 @@ class DistillLightningModule(pl.LightningModule):
         log_vals["w/cons_spatial"] = lambda_csp
         log_vals["aug_strength"] = aug_strength
 
+        # Emit loss-term ratio metrics for autopilot diagnostics
+        total = max(log_vals.get("loss", 0), 1e-8)
+        log_vals["ratio/summary_frac"] = log_vals.get("cos_sum", 0) / total
+        log_vals["ratio/spatial_frac"] = log_vals.get("cos_sp", 0) / total
+        log_vals["ratio/cons_frac"] = log_vals.get("loss_cons", 0) / (total + log_vals.get("loss_cons", 0) + 1e-8)
+
         self._scaler.scale(loss_consistency).backward()
         del loss_consistency, cons_summary, cons_spatial
         del s_sum_a, s_tokens_a, s_sum_c_det, s_tokens_c_det
@@ -307,18 +335,17 @@ class DistillLightningModule(pl.LightningModule):
         log_vals["lr"] = opts[0].param_groups[0]["lr"]
         log_vals["weight_decay"] = opts[0].param_groups[0].get("weight_decay", 0.0)
 
-        # 10. Logging — write directly to TB, bypass Lightning's metric accumulation
-        tb = self.logger.experiment
+        # 10. Logging
         step = self.global_step
         for k, v in log_vals.items():
-            tb.add_scalar(f"train/{k}", v, step)
-            self.log(f"train_{k}", v)
+            self._log(f"train/{k}", v, step)
 
         # Memory tracking
         if step % self.cfg.logging.mem_track_interval == 0 and torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / 1024**2
             resv = torch.cuda.memory_reserved() / 1024**2
-            print(f"[MEM] step={step} allocated={alloc:.0f}MB reserved={resv:.0f}MB")
+            self._log("train/mem_alloc_mb", alloc, step)
+            self._log("train/mem_resv_mb", resv, step)
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -368,9 +395,8 @@ class DistillLightningModule(pl.LightningModule):
         # Spatial compare logs for first few batches
         vsc = self.cfg.logging.val_spatial_compare
         if batch_idx % vsc.batch_mod == 0 and batch_idx < vsc.max_batches:
-            tb = self.logger.experiment
             log_spatial_compare_first_sample(
-                tb_writer=tb,
+                tb_writer=self._tb_writer,
                 step=self.global_step,
                 s_spatial_bdhw=s_sp,
                 t_tokens_btd=t_spatial_tokens,
@@ -451,71 +477,12 @@ class DistillLightningModule(pl.LightningModule):
         del s_hf, t_hf, s_hf_tok, t_hf_tok
 
     def on_validation_epoch_end(self):
-        # Just defragment GPU — reporting happens in on_train_epoch_end
-        torch.cuda.empty_cache()
-
-    def _compute_source_metrics(self, src: str, acc: dict) -> dict:
-        """Compute and log all metrics for one val source. Returns key values."""
-        n = acc["n"]
-        if n == 0:
-            return {}
-
-        tb = self.logger.experiment
-        step = self.global_step
-        quantiles = list(self.cfg.logging.quantiles)
-
-        # Mean losses
-        val_loss = acc["agg"].get("loss", 0.0) / n
-        for k, v in acc["agg"].items():
-            tb.add_scalar(f"val/{src}/{k}", v / n, step)
-
-        # Quantile metrics
-        if acc["summary_cos"]:
-            cat = torch.cat(acc["summary_cos"], dim=0)
-            tb.add_scalar(f"val/{src}/summary_cos_mean", cat.mean().item(), step)
-            for q in quantiles:
-                tb.add_scalar(f"val/{src}/summary_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
-
-        if acc["spatial_cos"]:
-            cat = torch.cat(acc["spatial_cos"], dim=0)
-            tb.add_scalar(f"val/{src}/spatial_cos_mean", cat.mean().item(), step)
-            for q in quantiles:
-                tb.add_scalar(f"val/{src}/spatial_cos_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
-
-        if acc["edge_corr"]:
-            cat = torch.cat(acc["edge_corr"], dim=0)
-            tb.add_scalar(f"val/{src}/edge_align_corr_mean", cat.mean().item(), step)
-            for q in quantiles:
-                tb.add_scalar(f"val/{src}/edge_align_corr_p{int(q*100):02d}", torch.quantile(cat, q).item(), step)
-
-        # Scalar means
-        for k, v in acc["scalar_sums"].items():
-            tb.add_scalar(f"val/{src}/{k}", v / n, step)
-
-        # Composite alignment score
-        cos_sum_sim = 1.0 - acc["agg"].get("cos_sum", 0.0) / n
-        cos_sp_sim  = 1.0 - acc["agg"].get("cos_sp", 0.0) / n
-        hf_cos_mean = acc["scalar_sums"].get("hf_cos", 0.0) / n
-        hf_mse_mean = acc["scalar_sums"].get("hf_mse", 0.0) / n
-        act_f1_mean = acc["scalar_sums"].get("act_f1", 0.0) / n
-
-        alignment_score = (
-            0.30 * cos_sum_sim + 0.30 * cos_sp_sim
-            + 0.20 * hf_cos_mean - 0.10 * hf_mse_mean
-            + 0.30 * act_f1_mean
-        )
-        tb.add_scalar(f"val/{src}/act_f1", act_f1_mean, step)
-        tb.add_scalar(f"val/{src}/alignment_score", alignment_score, step)
-
-        return {"alignment_score": alignment_score, "val_loss": val_loss}
-
-    def on_train_epoch_end(self):
-        # Check if any source has data
+        """Compute and log all val metrics after each validation run."""
         total_n = sum(acc["n"] for acc in self._val_per_source.values())
         if total_n == 0:
+            torch.cuda.empty_cache()
             return
 
-        tb = self.logger.experiment
         step = self.global_step
 
         # Compute per-source metrics
@@ -535,48 +502,108 @@ class DistillLightningModule(pl.LightningModule):
         else:
             off_dist_avg = 0.0
 
-        tb.add_scalar("val/in_dist/alignment_score", oi_score, step)
-        tb.add_scalar("val/off_dist/alignment_score", off_dist_avg, step)
+        self._log("val/in_dist/alignment_score", oi_score, step)
+        self._log("val/off_dist/alignment_score", off_dist_avg, step)
 
-        # Overall: 0.25 × oi_val + 0.375 × coco_train + 0.375 × imagenet_train
-        # Generalized: 0.25 × oi_val + 0.75 spread across off-dist sources
+        # Overall: 0.25 × oi_val + 0.75 spread across off-dist sources
         if off_dist_scores:
             off_weight_each = 0.75 / len(off_dist_scores)
             overall = 0.25 * oi_score + sum(off_weight_each * s for s in off_dist_scores)
         else:
             overall = oi_score
 
-        tb.add_scalar("val/alignment_score", overall, step)
+        self._log("val/alignment_score", overall, step)
         self._last_alignment_score = overall
 
-        val_metrics = {"alignment_score": overall, "in_dist_alignment": oi_score, "off_dist_alignment": off_dist_avg}
         for src, r in source_results.items():
             for k, v in r.items():
-                val_metrics[f"{src}_{k}"] = v
-        for k, v in val_metrics.items():
-            self.log(f"val_{k}", v)
+                self._log(f"val/{src}/{k}_agg", v, step)
 
         # Checkpointing on val improvement (use oi_val loss as primary)
         oi_loss = source_results.get("oi_val", {}).get("val_loss")
-        if oi_loss is not None:
+        if oi_loss is not None and not math.isnan(oi_loss):
             if self.best_val_loss is None or oi_loss < self.best_val_loss:
                 self.best_val_loss = oi_loss
                 self._save_checkpoint(step, oi_loss)
 
-        # Print epoch summary
+        # Print val summary
         parts = []
         for src in self._val_source_names:
             r = source_results.get(src, {})
             parts.append(f"{src}: loss={r.get('val_loss', 0):.4f} align={r.get('alignment_score', 0):.4f}")
         n_batches = {src: self._val_per_source[src]["n"] for src in self._val_source_names}
         print(
-            f"[VAL] epoch={self.current_epoch} step={step} overall_align={overall:.4f} "
+            f"[VAL] step={step} overall_align={overall:.4f} "
             f"| {' | '.join(parts)} "
             f"(batches: {n_batches})"
         )
 
-        # Reset accumulators for next epoch
+        # Reset accumulators for next eval run & free GPU
         self._reset_val_accumulators()
+        torch.cuda.empty_cache()
+
+    def _compute_source_metrics(self, src: str, acc: dict) -> dict:
+        """Compute and log all metrics for one val source. Returns key values."""
+        n = acc["n"]
+        if n == 0:
+            return {}
+
+        step = self.global_step
+        quantiles = list(self.cfg.logging.quantiles)
+
+        # Mean losses
+        val_loss = acc["agg"].get("loss", 0.0) / n
+        for k, v in acc["agg"].items():
+            self._log(f"val/{src}/{k}", v / n, step)
+
+        # Quantile metrics — subsample large tensors to avoid torch.quantile overflow
+        _MAX_QUANTILE_ELEMS = 1_000_000
+
+        if acc["summary_cos"]:
+            cat = torch.cat(acc["summary_cos"], dim=0)
+            self._log(f"val/{src}/summary_cos_mean", cat.mean().item(), step)
+            qcat = cat if cat.numel() <= _MAX_QUANTILE_ELEMS else cat[torch.randperm(cat.numel())[:_MAX_QUANTILE_ELEMS]]
+            for q in quantiles:
+                self._log(f"val/{src}/summary_cos_p{int(q*100):02d}", torch.quantile(qcat, q).item(), step)
+
+        if acc["spatial_cos"]:
+            cat = torch.cat(acc["spatial_cos"], dim=0)
+            self._log(f"val/{src}/spatial_cos_mean", cat.mean().item(), step)
+            qcat = cat if cat.numel() <= _MAX_QUANTILE_ELEMS else cat[torch.randperm(cat.numel())[:_MAX_QUANTILE_ELEMS]]
+            for q in quantiles:
+                self._log(f"val/{src}/spatial_cos_p{int(q*100):02d}", torch.quantile(qcat, q).item(), step)
+
+        if acc["edge_corr"]:
+            cat = torch.cat(acc["edge_corr"], dim=0)
+            self._log(f"val/{src}/edge_align_corr_mean", cat.mean().item(), step)
+            qcat = cat if cat.numel() <= _MAX_QUANTILE_ELEMS else cat[torch.randperm(cat.numel())[:_MAX_QUANTILE_ELEMS]]
+            for q in quantiles:
+                self._log(f"val/{src}/edge_align_corr_p{int(q*100):02d}", torch.quantile(qcat, q).item(), step)
+
+        # Scalar means
+        for k, v in acc["scalar_sums"].items():
+            self._log(f"val/{src}/{k}", v / n, step)
+
+        # Composite alignment score — weighted for dense downstream tasks
+        # (detection, segmentation favour spatial features, edge alignment, HF fidelity)
+        cos_sum_sim = 1.0 - acc["agg"].get("cos_sum", 0.0) / n
+        cos_sp_sim  = 1.0 - acc["agg"].get("cos_sp", 0.0) / n
+        hf_cos_mean = acc["scalar_sums"].get("hf_cos", 0.0) / n
+        hf_mse_mean = acc["scalar_sums"].get("hf_mse", 0.0) / n
+        act_f1_mean = acc["scalar_sums"].get("act_f1", 0.0) / n
+        edge_corr_mean = torch.cat(acc["edge_corr"]).mean().item() if acc["edge_corr"] else 0.0
+
+        alignment_score = (
+            0.15 * cos_sum_sim + 0.30 * cos_sp_sim
+            + 0.20 * hf_cos_mean - 0.10 * hf_mse_mean
+            + 0.25 * act_f1_mean
+            + 0.20 * max(edge_corr_mean, 0.0)  # edge alignment (clamped, can't go negative)
+        )
+        self._log(f"val/{src}/act_f1", act_f1_mean, step)
+        self._log(f"val/{src}/edge_corr", edge_corr_mean, step)
+        self._log(f"val/{src}/alignment_score", alignment_score, step)
+
+        return {"alignment_score": alignment_score, "val_loss": val_loss}
 
     def on_train_epoch_start(self):
         # Update dataset seed for pad-vs-squash variation
@@ -650,7 +677,7 @@ class DistillLightningModule(pl.LightningModule):
     @torch.no_grad()
     def _log_image_grids(self, img_u8: torch.Tensor, x_augmented: torch.Tensor, prefix: str):
         """Log teacher (un-augmented) and student (augmented) input grids. Both on CPU."""
-        tb = self.logger.experiment
+        tb = self._tb_writer
         step = self.global_step
         ig = self.cfg.logging.image_grid
         n = min(ig.n, img_u8.shape[0])

@@ -19,15 +19,17 @@ from distill.model import (
 from distill.lightning_module import DistillLightningModule
 
 
-def build_hotcb_callback(cfg, run_dir: str):
+def build_hotcb_callback(cfg, run_dir: str, mutable_state=None):
     """Build HotCBLightning callback with MetricsCollector.
 
     Args:
         cfg: OmegaConf config with hotcb section.
         run_dir: Experiment directory for hotcb JSONL files.
+        mutable_state: Optional dict to pass explicitly to HotCBLightning
+            (belt-and-suspenders with pl_module.mutable_state auto-detect).
 
     Returns:
-        (callback, metrics_collector) tuple, or (None, None) if disabled/unavailable.
+        callback or None if disabled/unavailable.
     """
     if not getattr(cfg, "hotcb", None) or not cfg.hotcb.enabled:
         return None
@@ -51,7 +53,7 @@ def build_hotcb_callback(cfg, run_dir: str):
         debounce_steps=cfg.hotcb.get("debounce_steps", 10),
     )
 
-    callback = HotCBLightning(kernel)
+    callback = HotCBLightning(kernel, mutable_state=mutable_state)
     key_metric = cfg.hotcb.get("key_metric", "alignment_score")
     print(f"[hotcb] Enabled — run_dir={run_dir}")
     print(f"[hotcb] Launch dashboard: hotcb serve --dir {run_dir}")
@@ -202,7 +204,7 @@ def main():
     )
 
     callbacks = []
-    hotcb_cb = build_hotcb_callback(cfg, run_dir=exp_dir)
+    hotcb_cb = build_hotcb_callback(cfg, run_dir=exp_dir, mutable_state=lit_module.mutable_state)
     if hotcb_cb is not None:
         callbacks.append(hotcb_cb)
 

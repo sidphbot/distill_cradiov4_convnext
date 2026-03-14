@@ -36,9 +36,9 @@ class OptunaCallback(pl.Callback):
         super().__init__()
         self.trial = trial
 
-    def on_train_epoch_end(self, trainer, pl_module):
+    def on_validation_epoch_end(self, trainer, pl_module):
         score = pl_module._last_alignment_score
-        self.trial.report(score, trainer.current_epoch)
+        self.trial.report(score, trainer.global_step)
         if self.trial.should_prune():
             raise optuna.TrialPruned()
 
