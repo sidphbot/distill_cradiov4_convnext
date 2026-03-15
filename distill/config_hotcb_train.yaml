@@ -51,17 +51,21 @@ training:
     momentum: 0.95
     nesterov: true
     ns_steps: 5
+  scheduler:
+    type: cosine          # cosine | none
+    warmup_steps: 500     # lr warmup from 0 → peak (in optimizer steps)
+    min_lr_ratio: 0.01    # min_lr = lr * min_lr_ratio at end of training
 
 loss:
   lambda_summary: 0.8
-  lambda_spatial: 1.5
+  lambda_spatial: 2.0     # boosted from 1.5 — prioritize dense spatial features
   lambda_mse: 0.5
   grad_eps: 1.0e-3
   ramp:
-    mse_sp:       { start: 0.5, end: 1.5, warmup_frac: 0.02 }
-    grad:         { start: 0.3, end: 2.0, warmup_frac: 0.025 }
+    mse_sp:       { start: 0.5, end: 2.5, warmup_frac: 0.02 }   # boosted from 1.5 — push per-position alignment
+    grad:         { start: 0.3, end: 4.0, warmup_frac: 0.025 }   # boosted from 2.0 — edge-aware features
     cons_summary: { start: 0.0, end: 0.3, warmup_frac: 0.015 }
-    cons_spatial: { start: 0.0, end: 0.7, warmup_frac: 0.025 }
+    cons_spatial: { start: 0.0, end: 1.5, warmup_frac: 0.025 }   # boosted from 0.7 — off-dist generalization
 
 augmentation:
   warmup_frac: 0.25

@@ -36,6 +36,16 @@ from distill.model import (
 )
 
 
+def _cosine_warmup_lambda(warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.01):
+    """Returns a lr_lambda for LambdaLR: linear warmup then cosine decay to min_lr_ratio."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_lambda
+
+
 def _normalize_batch(x: torch.Tensor, mean, std) -> torch.Tensor:
     """Normalize (B,3,H,W) float [0,1] tensor. In-place friendly."""
     m = torch.tensor(list(mean), device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
@@ -126,7 +136,8 @@ class DistillLightningModule(pl.LightningModule):
 
         # Manual grad accumulation & AMP
         self._grad_accum = cfg.training.grad_accum
-        self._scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.amp)
+        # Disable GradScaler — using bfloat16 which doesn't need loss scaling
+        self._scaler = torch.amp.GradScaler("cuda", enabled=False)
         self._micro_step = 0
 
         # Per-source val accumulators (initialized by set_val_source_names)
@@ -136,7 +147,9 @@ class DistillLightningModule(pl.LightningModule):
 
         self._steps_per_epoch = steps_per_epoch
         self._cached_opt = None
+        self._schedulers = []  # populated by configure_optimizers if cosine schedule enabled
         self._hotcb_metrics_path: str | None = None  # set by launcher/hotcb_integration
+        self._opt_step_count = 0  # manual step counter (global_step doesn't increment with manual opt)
 
     def set_val_source_names(self, names: list[str]):
         """Called after dm.setup() to configure per-source accumulators."""
@@ -156,7 +169,7 @@ class DistillLightningModule(pl.LightningModule):
     def _log(self, key: str, value: float, step: int | None = None):
         """Single funnel for all scalar logging (TB + Lightning self.log)."""
         if step is None:
-            step = self.global_step
+            step = self._opt_step_count
         self._tb_writer.add_scalar(key, value, step)
         # self.log expects flat key (no slashes), used by hotcb/callbacks
         flat_key = key.replace("/", "_")
@@ -198,15 +211,16 @@ class DistillLightningModule(pl.LightningModule):
         self.loss_w.lambda_spatial = ws["lambda_spatial"]
         self.loss_w.lambda_mse = ws["lambda_mse"]
 
-        spe = self._steps_per_epoch
+        # spe in optimizer steps (not micro-steps) since _opt_step_count counts opt steps
+        spe = self._steps_per_epoch // self._grad_accum
         self.loss_w.lambda_sp_mse = ramp_linear(
-            step=self.global_step,
+            step=self._opt_step_count,
             warmup_steps=int(self.cfg.loss.ramp.mse_sp.warmup_frac * spe),
             start=self.cfg.loss.ramp.mse_sp.start,
             end=ws["ramp_mse_sp_end"],
         )
         self.loss_w.lambda_grad = ramp_linear(
-            step=self.global_step,
+            step=self._opt_step_count,
             warmup_steps=int(self.cfg.loss.ramp.grad.warmup_frac * spe),
             start=self.cfg.loss.ramp.grad.start,
             end=ws["ramp_grad_end"],
@@ -214,7 +228,7 @@ class DistillLightningModule(pl.LightningModule):
 
         # 3. Prepare clean and augmented inputs on CPU
         aug_strength = ramp_linear(
-            self.global_step,
+            self._opt_step_count,
             int(self.cfg.augmentation.warmup_frac * spe),
             self.cfg.augmentation.strength_start,
             ws["aug_strength_end"],
@@ -222,8 +236,8 @@ class DistillLightningModule(pl.LightningModule):
 
         # Periodically log image grids (before we consume img_u8)
         log_images = (
-            self.global_step % (self.cfg.logging.log_every * self.cfg.logging.image_log_multiplier) == 0
-            and self.global_step > 0
+            self._opt_step_count % (self.cfg.logging.log_every * self.cfg.logging.image_log_multiplier) == 0
+            and self._opt_step_count > 0
         )
 
         # Clean input: float/255 + normalize (no augmentation)
@@ -250,28 +264,32 @@ class DistillLightningModule(pl.LightningModule):
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
         lambda_cs = ramp_linear(
-            step=self.global_step,
+            step=self._opt_step_count,
             warmup_steps=int(self.cfg.loss.ramp.cons_summary.warmup_frac * spe),
             start=self.cfg.loss.ramp.cons_summary.start,
             end=ws["ramp_cons_summary_end"],
         )
         lambda_csp = ramp_linear(
-            step=self.global_step,
+            step=self._opt_step_count,
             warmup_steps=int(self.cfg.loss.ramp.cons_spatial.warmup_frac * spe),
             start=self.cfg.loss.ramp.cons_spatial.start,
             end=ws["ramp_cons_spatial_end"],
         )
 
         # --- Phase A: clean forward → distill loss → backward (frees clean graph) ---
-        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
+        # Use bfloat16 autocast: same exponent range as float32 (no overflow),
+        # same memory savings as float16. ConvNeXt stage2 features overflow in float16.
+        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp, dtype=torch.bfloat16):
             s_sum_c, s_tokens_c, s_sp_c, (f2, f3) = self.model(x_clean)
             del x_clean, f2, f3
 
-            out = compute_losses(
-                s_sum_c, s_tokens_c, s_sp_c, t_summary, t_spatial_tokens,
-                self.loss_w, self.cfg.loss.grad_eps, self.Ht, self.Wt,
-            )
-            distill_loss = out["loss"] / self._grad_accum
+        # Compute losses in float32
+        out = compute_losses(
+            s_sum_c.float(), s_tokens_c.float(), s_sp_c.float(),
+            t_summary, t_spatial_tokens,
+            self.loss_w, self.cfg.loss.grad_eps, self.Ht, self.Wt,
+        )
+        distill_loss = out["loss"] / self._grad_accum
 
         log_vals = {k: v.item() for k, v in out.items()}
 
@@ -283,13 +301,14 @@ class DistillLightningModule(pl.LightningModule):
         del distill_loss, out, s_sum_c, s_tokens_c, s_sp_c
 
         # --- Phase B: augmented forward → consistency loss → backward ---
-        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
+        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp, dtype=torch.bfloat16):
             s_sum_a, s_tokens_a, s_sp_a, _ = self.model(x_aug)
             del x_aug, s_sp_a
 
-            cons_summary = cosine_loss(s_sum_a, s_sum_c_det)
-            cons_spatial = cosine_loss_spatial_tokens(s_tokens_a, s_tokens_c_det)
-            loss_consistency = (lambda_cs * cons_summary + lambda_csp * cons_spatial) / self._grad_accum
+        # Consistency losses in float32
+        cons_summary = cosine_loss(s_sum_a.float(), s_sum_c_det.float())
+        cons_spatial = cosine_loss_spatial_tokens(s_tokens_a.float(), s_tokens_c_det.float())
+        loss_consistency = (lambda_cs * cons_summary + lambda_csp * cons_spatial) / self._grad_accum
 
         log_vals["cons_summary"] = cons_summary.item()
         log_vals["cons_spatial"] = cons_spatial.item()
@@ -330,14 +349,18 @@ class DistillLightningModule(pl.LightningModule):
             self._scaler.update()
             for opt in opts:
                 opt.zero_grad(set_to_none=True)
+            # Step schedulers (cosine warmup)
+            for sched in self._schedulers:
+                sched.step()
             self._micro_step = 0
+            self._opt_step_count += 1
 
         # Log optimizer state
         log_vals["lr"] = opts[0].param_groups[0]["lr"]
         log_vals["weight_decay"] = opts[0].param_groups[0].get("weight_decay", 0.0)
 
         # 10. Logging
-        step = self.global_step
+        step = self._opt_step_count
         for k, v in log_vals.items():
             self._log(f"train/{k}", v, step)
 
@@ -347,6 +370,22 @@ class DistillLightningModule(pl.LightningModule):
             resv = torch.cuda.memory_reserved() / 1024**2
             self._log("train/mem_alloc_mb", alloc, step)
             self._log("train/mem_resv_mb", resv, step)
+
+        # Write train metrics directly to hotcb JSONL on optimizer steps
+        # (bypasses Lightning callback_metrics which loses data after validation)
+        if self._hotcb_metrics_path and self._micro_step == 0 and step % self.cfg.logging.log_every == 0:
+            import json, time as _time
+            train_metrics = {f"train_{k}": v for k, v in log_vals.items()}
+            train_metrics["lr"] = log_vals.get("lr", 0)
+            try:
+                with open(self._hotcb_metrics_path, "a") as f:
+                    f.write(json.dumps({
+                        "step": step, "epoch": self.current_epoch,
+                        "wall_time": _time.time(), "phase": "train",
+                        "metrics": train_metrics,
+                    }) + "\n")
+            except Exception:
+                pass
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -410,7 +449,7 @@ class DistillLightningModule(pl.LightningModule):
         if batch_idx % vsc.batch_mod == 0 and batch_idx < vsc.max_batches:
             log_spatial_compare_first_sample(
                 tb_writer=self._tb_writer,
-                step=self.global_step,
+                step=self._opt_step_count,
                 s_spatial_bdhw=s_sp,
                 t_tokens_btd=t_spatial_tokens,
                 Ht=self.Ht,
@@ -465,16 +504,17 @@ class DistillLightningModule(pl.LightningModule):
         del s_tokens2, t_tokens2
 
         # Edge alignment (all CPU)
+        # Downsample image to feature resolution FIRST, then Sobel —
+        # computing Sobel at 416x416 and downsampling destroys edge structure
         x_gray = x_c.mean(dim=1, keepdim=True)
-        g_img = _sobel_mag_2d(x_gray)
-        del x_c, x_gray
+        del x_c
+        x_gray_ds = F.interpolate(x_gray, size=(self.Ht, self.Wt), mode="bilinear", align_corners=False)
+        del x_gray
+        g_img_ds = _sobel_mag_2d(x_gray_ds)
+        del x_gray_ds
         s_energy_map = torch.sqrt((s_sp_c * s_sp_c).sum(dim=1, keepdim=True) + 1e-8)
-        g_feat = _sobel_mag_2d(s_energy_map)
-        del s_energy_map
-        g_img_ds = F.interpolate(g_img, size=(self.Ht, self.Wt), mode="bilinear", align_corners=False)
-        del g_img
-        acc["edge_corr"].append(_pearson_corr_per_sample(g_feat.flatten(1), g_img_ds.flatten(1)))
-        del g_feat, g_img_ds
+        acc["edge_corr"].append(_pearson_corr_per_sample(s_energy_map.flatten(1), g_img_ds.flatten(1)))
+        del s_energy_map, g_img_ds
 
         # HF metrics (all CPU)
         s_hf = _laplacian_highpass_depthwise(s_sp_c)
@@ -496,7 +536,7 @@ class DistillLightningModule(pl.LightningModule):
             torch.cuda.empty_cache()
             return
 
-        step = self.global_step
+        step = self._opt_step_count
 
         # Compute per-source metrics
         source_results = {}
@@ -584,7 +624,7 @@ class DistillLightningModule(pl.LightningModule):
         if n == 0:
             return {}
 
-        step = self.global_step
+        step = self._opt_step_count
 
         # Mean losses
         val_loss = acc["agg"].get("loss", 0.0) / n
@@ -627,7 +667,12 @@ class DistillLightningModule(pl.LightningModule):
         self._log(f"val/{src}/edge_corr", edge_corr_mean, step)
         self._log(f"val/{src}/alignment_score", alignment_score, step)
 
-        return {"alignment_score": alignment_score, "val_loss": val_loss}
+        return {
+            "alignment_score": alignment_score, "val_loss": val_loss,
+            "cos_sum_sim": cos_sum_sim, "cos_sp_sim": cos_sp_sim,
+            "hf_cos": hf_cos_mean, "hf_mse": hf_mse_mean,
+            "act_f1": act_f1_mean, "edge_corr": edge_corr_mean,
+        }
 
     def on_train_epoch_start(self):
         # Update dataset seed for pad-vs-squash variation
@@ -642,14 +687,12 @@ class DistillLightningModule(pl.LightningModule):
 
         if opt_type == "adamw_muon":
             # Combined AdamW (norms/biases) + Muon (weight matrices)
-            # Collect all submodules into one namespace for param splitting
             from itertools import chain
             all_named = list(chain(
                 self.model.student.named_parameters(),
                 self.model.sum_head.named_parameters(),
                 self.model.sp_head.named_parameters(),
             ))
-            # Build a temporary nn.Module-like wrapper so build_adamw_muon_optimizer works
             combined = torch.nn.Module()
             for i, (name, p) in enumerate(all_named):
                 combined.register_parameter(f"p{i}_{name.replace('.', '_')}", p)
@@ -666,7 +709,6 @@ class DistillLightningModule(pl.LightningModule):
                 muon_nesterov=muon_cfg.nesterov,
                 muon_ns_steps=muon_cfg.ns_steps,
             )
-            return optimizers
         else:
             # Standard AdamW
             params = []
@@ -678,7 +720,27 @@ class DistillLightningModule(pl.LightningModule):
                 params, lr=self.cfg.training.lr,
                 betas=betas, eps=self.cfg.training.optimizer.eps,
             )
-            return opt
+            optimizers = [opt]
+
+        # Build cosine scheduler with warmup (stepped manually in training_step)
+        sched_cfg = getattr(self.cfg.training, "scheduler", None)
+        if sched_cfg and getattr(sched_cfg, "type", "none") == "cosine":
+            total_steps = self._steps_per_epoch // self._grad_accum * self.cfg.training.epochs
+            warmup_steps = getattr(sched_cfg, "warmup_steps", 500)
+            min_lr_ratio = getattr(sched_cfg, "min_lr_ratio", 0.01)
+            self._schedulers = []
+            for opt in (optimizers if isinstance(optimizers, list) else [optimizers]):
+                sched = torch.optim.lr_scheduler.LambdaLR(
+                    opt,
+                    lr_lambda=_cosine_warmup_lambda(warmup_steps, total_steps, min_lr_ratio),
+                )
+                self._schedulers.append(sched)
+            print(f"[scheduler] Cosine with warmup: {warmup_steps} warmup steps, "
+                  f"{total_steps} total steps, min_lr_ratio={min_lr_ratio}")
+        else:
+            self._schedulers = []
+
+        return optimizers
 
     def _save_checkpoint(self, step: int, val_loss: float):
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -702,7 +764,7 @@ class DistillLightningModule(pl.LightningModule):
     def _log_image_grids(self, img_u8: torch.Tensor, x_augmented: torch.Tensor, prefix: str):
         """Log teacher (un-augmented) and student (augmented) input grids. Both on CPU."""
         tb = self._tb_writer
-        step = self.global_step
+        step = self._opt_step_count
         ig = self.cfg.logging.image_grid
         n = min(ig.n, img_u8.shape[0])
 
