@@ -140,6 +140,7 @@ def train(run_dir: str, max_steps: int, step_delay: float,
     callbacks = []
     if hotcb_cb is not None:
         callbacks.append(hotcb_cb)
+        lit_module._hotcb_metrics_path = os.path.join(run_dir, "hotcb.metrics.jsonl")
 
     # ── stop_event callback ──────────────────────────────────────────
     callbacks.append(_StopEventCallback(stop_event))

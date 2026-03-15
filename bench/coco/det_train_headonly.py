@@ -78,8 +78,9 @@ def build_parser():
 
 def build_detector(backbone_wrapper, out_channels, num_classes):
     """Build FasterRCNN with custom backbone and anchor generator."""
-    anchor_sizes = ((32,), (64,), (128,), (256,))
-    aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+    # Single feature map → single tuple of anchor sizes
+    anchor_sizes = ((32, 64, 128, 256),)
+    aspect_ratios = ((0.5, 1.0, 2.0),)
     anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
 
     roi_pooler = torch.ops.torchvision.roi_align

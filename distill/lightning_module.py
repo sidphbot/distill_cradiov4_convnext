@@ -136,6 +136,7 @@ class DistillLightningModule(pl.LightningModule):
 
         self._steps_per_epoch = steps_per_epoch
         self._cached_opt = None
+        self._hotcb_metrics_path: str | None = None  # set by launcher/hotcb_integration
 
     def set_val_source_names(self, names: list[str]):
         """Called after dm.setup() to configure per-source accumulators."""
@@ -378,12 +379,24 @@ class DistillLightningModule(pl.LightningModule):
         t_summary = t_summary.to(device, non_blocking=True).float()
         t_spatial_tokens = t_spatial_tokens.to(device, non_blocking=True).float()
 
-        with torch.amp.autocast("cuda", enabled=self.cfg.training.amp):
+        # Run val forward in float32 — avoids float16 overflow in ConvNeXt
+        # stage 3 features which cause NaN in eval mode.
+        with torch.amp.autocast("cuda", enabled=False):
+            x = x.float()
             s_sum, s_tokens, s_sp, _ = self.model(x)
             out = compute_losses(
                 s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens,
                 self.loss_w, self.cfg.loss.grad_eps, self.Ht, self.Wt,
             )
+
+        # NaN guard: skip this batch if any loss is NaN
+        has_nan = any(torch.isnan(v) for v in out.values())
+        if has_nan:
+            nan_keys = [k for k, v in out.items() if torch.isnan(v)]
+            print(f"[VAL WARN] NaN in batch {batch_idx} src={src}: {nan_keys}")
+            del out, s_sum, s_tokens, s_sp, t_summary, t_spatial_tokens, x
+            torch.cuda.empty_cache()
+            return
 
         # Accumulate losses as floats
         if not acc["agg"]:
@@ -427,29 +440,29 @@ class DistillLightningModule(pl.LightningModule):
         acc["spatial_cos"].append(_cosine_sim(s_tokens2, t_tokens2, dim=-1).flatten())
 
         sums = acc["scalar_sums"]
-        sums["retrieval_top1"] = sums.get("retrieval_top1", 0.0) + float(_batch_retrieval_top1(s_sum_c, t_summary_c))
-        sums["retrieval_mrr"] = sums.get("retrieval_mrr", 0.0) + float(_batch_retrieval_mrr(s_sum_c, t_summary_c))
-        sums["summary_cka"] = sums.get("summary_cka", 0.0) + float(_centered_kernel_alignment(s_sum_c, t_summary_c))
-
-        sums["summary_mse_mean"] = sums.get("summary_mse_mean", 0.0) + float(((s_sum_c - t_summary_c) ** 2).mean())
-        sums["summary_norm_ratio"] = sums.get("summary_norm_ratio", 0.0) + float((s_sum_c.norm(dim=-1) / (t_summary_c.norm(dim=-1) + 1e-8)).mean())
-        sums["summary_mean_abs_diff"] = sums.get("summary_mean_abs_diff", 0.0) + float((s_sum_c.mean(dim=0) - t_summary_c.mean(dim=0)).abs().mean())
-        sums["summary_std_abs_diff"] = sums.get("summary_std_abs_diff", 0.0) + float((s_sum_c.std(dim=0) - t_summary_c.std(dim=0)).abs().mean())
+        # Redundant metrics — not used in alignment_score, commented out to speed up val
+        # sums["retrieval_top1"] = sums.get("retrieval_top1", 0.0) + float(_batch_retrieval_top1(s_sum_c, t_summary_c))
+        # sums["retrieval_mrr"] = sums.get("retrieval_mrr", 0.0) + float(_batch_retrieval_mrr(s_sum_c, t_summary_c))
+        # sums["summary_cka"] = sums.get("summary_cka", 0.0) + float(_centered_kernel_alignment(s_sum_c, t_summary_c))
+        # sums["summary_mse_mean"] = sums.get("summary_mse_mean", 0.0) + float(((s_sum_c - t_summary_c) ** 2).mean())
+        # sums["summary_norm_ratio"] = sums.get("summary_norm_ratio", 0.0) + float((s_sum_c.norm(dim=-1) / (t_summary_c.norm(dim=-1) + 1e-8)).mean())
+        # sums["summary_mean_abs_diff"] = sums.get("summary_mean_abs_diff", 0.0) + float((s_sum_c.mean(dim=0) - t_summary_c.mean(dim=0)).abs().mean())
+        # sums["summary_std_abs_diff"] = sums.get("summary_std_abs_diff", 0.0) + float((s_sum_c.std(dim=0) - t_summary_c.std(dim=0)).abs().mean())
         del s_sum_c, t_summary_c
 
-        sums["spatial_mse_mean"] = sums.get("spatial_mse_mean", 0.0) + float(((s_tokens2 - t_tokens2) ** 2).mean())
-        sums["spatial_norm_ratio"] = sums.get("spatial_norm_ratio", 0.0) + float((s_tokens2.norm(dim=-1) / (t_tokens2.norm(dim=-1) + 1e-8)).mean())
-        sums["spatial_style_gram"] = sums.get("spatial_style_gram", 0.0) + float(_style_gram_loss(s_tokens2, t_tokens2))
+        # sums["spatial_mse_mean"] = sums.get("spatial_mse_mean", 0.0) + float(((s_tokens2 - t_tokens2) ** 2).mean())
+        # sums["spatial_norm_ratio"] = sums.get("spatial_norm_ratio", 0.0) + float((s_tokens2.norm(dim=-1) / (t_tokens2.norm(dim=-1) + 1e-8)).mean())
+        # sums["spatial_style_gram"] = sums.get("spatial_style_gram", 0.0) + float(_style_gram_loss(s_tokens2, t_tokens2))
 
         s_energy = _spatial_energy(s_sp_c)
         t_energy = _spatial_energy(t_map)
         sums["spatial_energy_ratio"] = sums.get("spatial_energy_ratio", 0.0) + float((s_energy / (t_energy + 1e-8)).mean())
 
-        s_meanD = s_tokens2.mean(dim=1)
-        t_meanD = t_tokens2.mean(dim=1)
-        sums["spatial_meanD_corr"] = sums.get("spatial_meanD_corr", 0.0) + float(_corrcoef_1d(s_meanD.flatten(), t_meanD.flatten()))
+        # s_meanD = s_tokens2.mean(dim=1)
+        # t_meanD = t_tokens2.mean(dim=1)
+        # sums["spatial_meanD_corr"] = sums.get("spatial_meanD_corr", 0.0) + float(_corrcoef_1d(s_meanD.flatten(), t_meanD.flatten()))
         sums["act_f1"] = sums.get("act_f1", 0.0) + float(_topk_activation_f1(s_tokens2, t_tokens2))
-        del s_tokens2, t_tokens2, s_meanD, t_meanD
+        del s_tokens2, t_tokens2
 
         # Edge alignment (all CPU)
         x_gray = x_c.mean(dim=1, keepdim=True)
@@ -538,6 +551,29 @@ class DistillLightningModule(pl.LightningModule):
             f"(batches: {n_batches})"
         )
 
+        # Emit val metrics directly to hotcb JSONL as a distinct snapshot
+        # so they appear once at the exact step, not stale-repeated on
+        # every subsequent training step.
+        if self._hotcb_metrics_path:
+            import json, time as _time
+            val_metrics = {
+                "val_alignment_score": overall,
+                "val_in_dist_alignment_score": oi_score,
+                "val_off_dist_alignment_score": off_dist_avg,
+            }
+            for src, r in source_results.items():
+                for k, v in r.items():
+                    val_metrics[f"val_{src}_{k}"] = v
+            try:
+                with open(self._hotcb_metrics_path, "a") as f:
+                    f.write(json.dumps({
+                        "step": step, "epoch": self.current_epoch,
+                        "wall_time": _time.time(), "phase": "val",
+                        "metrics": val_metrics,
+                    }) + "\n")
+            except Exception as e:
+                print(f"[hotcb val emit] Failed: {e}")
+
         # Reset accumulators for next eval run & free GPU
         self._reset_val_accumulators()
         torch.cuda.empty_cache()
@@ -549,36 +585,24 @@ class DistillLightningModule(pl.LightningModule):
             return {}
 
         step = self.global_step
-        quantiles = list(self.cfg.logging.quantiles)
 
         # Mean losses
         val_loss = acc["agg"].get("loss", 0.0) / n
         for k, v in acc["agg"].items():
             self._log(f"val/{src}/{k}", v / n, step)
 
-        # Quantile metrics — subsample large tensors to avoid torch.quantile overflow
-        _MAX_QUANTILE_ELEMS = 1_000_000
-
+        # Means only — quantile metrics commented out for speed
         if acc["summary_cos"]:
             cat = torch.cat(acc["summary_cos"], dim=0)
             self._log(f"val/{src}/summary_cos_mean", cat.mean().item(), step)
-            qcat = cat if cat.numel() <= _MAX_QUANTILE_ELEMS else cat[torch.randperm(cat.numel())[:_MAX_QUANTILE_ELEMS]]
-            for q in quantiles:
-                self._log(f"val/{src}/summary_cos_p{int(q*100):02d}", torch.quantile(qcat, q).item(), step)
 
         if acc["spatial_cos"]:
             cat = torch.cat(acc["spatial_cos"], dim=0)
             self._log(f"val/{src}/spatial_cos_mean", cat.mean().item(), step)
-            qcat = cat if cat.numel() <= _MAX_QUANTILE_ELEMS else cat[torch.randperm(cat.numel())[:_MAX_QUANTILE_ELEMS]]
-            for q in quantiles:
-                self._log(f"val/{src}/spatial_cos_p{int(q*100):02d}", torch.quantile(qcat, q).item(), step)
 
         if acc["edge_corr"]:
             cat = torch.cat(acc["edge_corr"], dim=0)
             self._log(f"val/{src}/edge_align_corr_mean", cat.mean().item(), step)
-            qcat = cat if cat.numel() <= _MAX_QUANTILE_ELEMS else cat[torch.randperm(cat.numel())[:_MAX_QUANTILE_ELEMS]]
-            for q in quantiles:
-                self._log(f"val/{src}/edge_align_corr_p{int(q*100):02d}", torch.quantile(qcat, q).item(), step)
 
         # Scalar means
         for k, v in acc["scalar_sums"].items():

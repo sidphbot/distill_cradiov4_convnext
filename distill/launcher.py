@@ -207,6 +207,7 @@ def main():
     hotcb_cb = build_hotcb_callback(cfg, run_dir=exp_dir, mutable_state=lit_module.mutable_state)
     if hotcb_cb is not None:
         callbacks.append(hotcb_cb)
+        lit_module._hotcb_metrics_path = os.path.join(exp_dir, "hotcb.metrics.jsonl")
 
     trainer = pl.Trainer(
         max_epochs=cfg.training.epochs,

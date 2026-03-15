@@ -177,14 +177,16 @@ def write_markdown(groups: dict, out_path: str):
         lines.append("|-----|-----|------|------|-----|-----|-----|")
         for e in groups["detection"]:
             m = e.get("metrics", {})
+            def fmt(v):
+                return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
             lines.append(
                 f"| {e['run']} "
-                f"| {m.get('mAP', 'N/A'):.4f} "
-                f"| {m.get('AP50', 'N/A'):.4f} "
-                f"| {m.get('AP75', 'N/A'):.4f} "
-                f"| {m.get('APS', 'N/A'):.4f} "
-                f"| {m.get('APM', 'N/A'):.4f} "
-                f"| {m.get('APL', 'N/A'):.4f} |"
+                f"| {fmt(m.get('mAP', 'N/A'))} "
+                f"| {fmt(m.get('AP50', 'N/A'))} "
+                f"| {fmt(m.get('AP75', 'N/A'))} "
+                f"| {fmt(m.get('APS', 'N/A'))} "
+                f"| {fmt(m.get('APM', 'N/A'))} "
+                f"| {fmt(m.get('APL', 'N/A'))} |"
             )
         lines.append("")
 

@@ -201,12 +201,20 @@ def evaluate(args):
     all_sp_cos = torch.cat(spatial_cos_all)
     all_edge = torch.cat(edge_corr_all)
 
+    def safe_quantile(t, q):
+        """Quantile that handles tensors too large for torch.quantile."""
+        if t.numel() <= 2**24:
+            return float(t.quantile(q))
+        # Subsample for large tensors
+        idx = torch.randperm(t.numel())[:2**24]
+        return float(t.flatten()[idx].quantile(q))
+
     results["summary_cos_mean"] = float(all_sum_cos.mean())
-    results["summary_cos_q05"] = float(all_sum_cos.quantile(0.05))
-    results["summary_cos_q95"] = float(all_sum_cos.quantile(0.95))
+    results["summary_cos_q05"] = safe_quantile(all_sum_cos, 0.05)
+    results["summary_cos_q95"] = safe_quantile(all_sum_cos, 0.95)
     results["spatial_cos_mean"] = float(all_sp_cos.mean())
-    results["spatial_cos_q05"] = float(all_sp_cos.quantile(0.05))
-    results["spatial_cos_q95"] = float(all_sp_cos.quantile(0.95))
+    results["spatial_cos_q05"] = safe_quantile(all_sp_cos, 0.05)
+    results["spatial_cos_q95"] = safe_quantile(all_sp_cos, 0.95)
     results["edge_corr_mean"] = float(all_edge.mean())
 
     # Composite alignment score (same weights as lightning_module)

@@ -9,10 +9,11 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 from PIL import Image
@@ -25,6 +26,33 @@ from bench.common.config import (
 from bench.common.model_loaders import load_teacher, load_student
 from bench.common.preprocess import normalize_batch
 from bench.common.io import save_run_meta
+
+
+class FlatImageNetDataset(Dataset):
+    """ImageNet stored as flat files with a JSON label map."""
+
+    def __init__(self, img_dir: str, label_json: str, transform=None):
+        self.img_dir = Path(img_dir)
+        self.transform = transform
+        with open(label_json) as f:
+            label_map = json.load(f)
+        # Sort for deterministic order
+        self.samples = sorted(label_map.items(), key=lambda x: x[0])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        stem, label = self.samples[idx]
+        # Try common extensions
+        for ext in (".jpg", ".jpeg", ".JPEG", ".png"):
+            path = self.img_dir / f"{stem}{ext}"
+            if path.exists():
+                break
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
 
 
 def build_parser():
@@ -71,11 +99,20 @@ def extract(args):
     use_amp = parse_amp(args) and device == "cuda"
 
     split_dir = Path(args.imagenet_root) / args.split
+    ann_dir = Path(args.imagenet_root) / "annotations"
+    label_json = ann_dir / f"{args.split}_labels.json"
+
+    # Detect flat vs ImageFolder structure
+    first_entry = next(split_dir.iterdir(), None)
+    use_flat = label_json.exists() and first_entry is not None and first_entry.is_file()
 
     if args.model == "teacher":
         teacher_b = load_teacher(args.teacher_id, device, use_amp)
 
-        ds = datasets.ImageFolder(str(split_dir))
+        if use_flat:
+            ds = FlatImageNetDataset(str(split_dir), str(label_json))
+        else:
+            ds = datasets.ImageFolder(str(split_dir))
         collate = TeacherCollate(args.size)
         loader = DataLoader(
             ds, batch_size=args.batch_size, shuffle=False,
@@ -112,7 +149,10 @@ def extract(args):
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ])
-        ds = datasets.ImageFolder(str(split_dir), transform=transform)
+        if use_flat:
+            ds = FlatImageNetDataset(str(split_dir), str(label_json), transform=transform)
+        else:
+            ds = datasets.ImageFolder(str(split_dir), transform=transform)
         loader = DataLoader(
             ds, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers, pin_memory=True, drop_last=False,

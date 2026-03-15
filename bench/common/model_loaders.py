@@ -49,17 +49,23 @@ def load_student(ckpt_path: str,
                  device: str = "cuda",
                  size: int = DEFAULT_SIZE,
                  patch_size: int = DEFAULT_PATCH_SIZE) -> StudentBundle:
-    """Load student from checkpoint. Resolves timm name via STUDENT_MODELS mapping."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    """Load student from checkpoint. Handles both legacy and new checkpoint formats."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    # Resolve variant → timm name
-    variant = ckpt.get("variant", "tiny")
-    student_name = STUDENT_MODELS[variant]
+    # Resolve student name — may be a variant key ("tiny") or full timm name
+    raw_name = ckpt.get("student_name", ckpt.get("variant", "tiny"))
+    student_name = STUDENT_MODELS.get(raw_name, raw_name)
 
-    Ct = ckpt["Ct"]
-    Dt = ckpt["Dt"]
-    Ht = size // patch_size
-    Wt = size // patch_size
+    # Resolve dims — legacy uses 'teacher_summary_dim'/'teacher_spatial_dim', new uses 'Ct'/'Dt'
+    Ct = ckpt.get("Ct", ckpt.get("teacher_summary_dim"))
+    Dt = ckpt.get("Dt", ckpt.get("teacher_spatial_dim"))
+    if Ct is None or Dt is None:
+        raise ValueError(f"Checkpoint missing teacher dims. Keys: {list(ckpt.keys())}")
+
+    sz = ckpt.get("size", size)
+    ps = ckpt.get("patch_size", patch_size)
+    Ht = sz // ps
+    Wt = sz // ps
 
     # Build student backbone
     student = timm.create_model(
@@ -71,7 +77,7 @@ def load_student(ckpt_path: str,
 
     # Infer channel dims from a dummy forward
     with torch.no_grad():
-        f2, f3 = student(torch.randn(1, 3, size, size))
+        f2, f3 = student(torch.randn(1, 3, sz, sz))
         Cs_sp = f2.shape[1]
         Cs = f3.shape[1]
 
@@ -87,7 +93,14 @@ def load_student(ckpt_path: str,
         spatial_norm_cap=spatial_norm_cap,
     )
 
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Load weights — legacy saves separate dicts, new saves full model_state_dict
+    if "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+    else:
+        model.student.load_state_dict(ckpt["student_state_dict"])
+        model.sum_head.load_state_dict(ckpt["sum_head_state_dict"])
+        model.sp_head.load_state_dict(ckpt["sp_head_state_dict"])
+
     model = model.to(device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -95,8 +108,8 @@ def load_student(ckpt_path: str,
     return StudentBundle(
         model=model,
         student_name=student_name,
-        size=size,
-        patch_size=patch_size,
+        size=sz,
+        patch_size=ps,
         Ct=Ct, Dt=Dt, Ht=Ht, Wt=Wt,
         device=device,
     )
